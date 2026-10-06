@@ -247,6 +247,7 @@ class HealthCheckServer(BaseHTTPRequestHandler):
 def run_health_server():
     server = HTTPServer(("0.0.0.0", 10000), HealthCheckServer)
     server.serve_forever()
+
 if name == "main":
 print("🚀 [System] Inizializzazione moduli asincroni dell'applicazione...", flush=True)
 # 1. Avvia il thread asincrono preferenziale per l'invio immediato a Telegram
