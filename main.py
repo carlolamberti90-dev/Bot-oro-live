@@ -628,7 +628,8 @@ def health_snapshot():
         "closed_candles": closed,
         "ready": ready,
         "timeframes": list(TIMEFRAMES.keys()),
-        "audit_file": str(AUDIT_FILE),
+        "audit_enabled": AUDIT_ENABLED,
+        "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
     }
 
 class HealthHandler(BaseHTTPRequestHandler):
