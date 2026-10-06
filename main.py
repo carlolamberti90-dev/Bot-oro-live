@@ -5,6 +5,7 @@ import queue
 import logging
 import threading
 import collections
+import sqlite3
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,10 @@ PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
 STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "180"))
 PERSIST_EVERY_SECONDS = int(os.getenv("PERSIST_EVERY_SECONDS", "60"))
+BOOTSTRAP_ENABLED = os.getenv("BOOTSTRAP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BOOTSTRAP_RESOLUTION = os.getenv("BOOTSTRAP_RESOLUTION", "1").strip()
+BOOTSTRAP_LOOKBACK_MINUTES = int(os.getenv("BOOTSTRAP_LOOKBACK_MINUTES", "43200"))
+STATE_DB = Path(os.getenv("STATE_DB", "bot_state.sqlite3"))
 
 PIVOT_LENGTH = 3
 VOLUME_LOOKBACK = 22  # user setting; LuxAlgo source default is 20
@@ -101,6 +106,8 @@ last_connection_time = None
 last_alert_time = None
 last_alert = {}
 ws_connected = False
+bootstrap_completed = False
+bootstrap_error = None
 
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AUDIT_FILE = Path(os.getenv("AUDIT_FILE", "bubble_audit.jsonl"))
@@ -567,13 +574,16 @@ def deserialize_candle(d):
     c.profile = {float(k): float(v) for k, v in d.get("profile", {}).items()}
     return c
 
-def save_state():
-    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+def state_payload():
     with state_lock:
-        payload = {
-            "version": 1,
+        return {
+            "version": 2,
             "saved_at": time.time(),
-            "history": {tf: [serialize_candle(c) for c in history[tf]] for tf in TIMEFRAMES},
+            "history": {tf: [serialize_candle(x) for x in history[tf]] for tf in TIMEFRAMES},
+            "current_candles": {
+                tf: None if current_candles[tf] is None else serialize_candle(current_candles[tf])
+                for tf in TIMEFRAMES
+            },
             "order_blocks": {
                 tf: [
                     {
@@ -596,44 +606,172 @@ def save_state():
                 } for tf in TIMEFRAMES
             },
         }
+
+def restore_payload(payload):
+    with state_lock:
+        for tf in TIMEFRAMES:
+            history[tf].clear()
+            for item in payload.get("history", {}).get(tf, [])[-MAX_HISTORY:]:
+                history[tf].append(deserialize_candle(item))
+            current = payload.get("current_candles", {}).get(tf)
+            current_candles[tf] = deserialize_candle(current) if current else None
+            order_blocks[tf] = [
+                OrderBlock(**b) for b in payload.get("order_blocks", {}).get(tf, [])
+            ][-40:]
+
+        last_alert.clear()
+        last_alert.update({k: float(v) for k, v in payload.get("last_alert", {}).items()})
+        saved_structure = payload.get("structure_state", {})
+        for tf in TIMEFRAMES:
+            st = saved_structure.get(tf, {})
+            last_pivot_high[tf] = st.get("last_pivot_high")
+            last_pivot_low[tf] = st.get("last_pivot_low")
+            trend_state[tf] = int(st.get("trend", 0))
+            high_period = st.get("last_pivot_high_period")
+            low_period = st.get("last_pivot_low_period")
+            last_pivot_high_candle[tf] = next((x for x in history[tf] if x.period == high_period), None)
+            last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
+
+def save_state():
+    payload = state_payload()
     try:
-        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(STATE_DB) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK (id=1), payload TEXT NOT NULL, saved_at REAL NOT NULL)")
+            db.execute(
+                "INSERT INTO state(id,payload,saved_at) VALUES(1,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, saved_at=excluded.saved_at",
+                (json.dumps(payload, separators=(",", ":")), payload["saved_at"]),
+            )
+            db.commit()
     except Exception as exc:
-        log.warning("Persistenza stato non disponibile: %s", exc)
+        log.warning("Persistenza SQLite non disponibile: %s", exc)
 
 def load_state():
-    if not STATE_FILE.exists():
-        return
+    # Prefer SQLite; fall back to the previous JSON state once for migration.
     try:
-        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        with state_lock:
-            for tf in TIMEFRAMES:
-                history[tf].clear()
-                for item in payload.get("history", {}).get(tf, [])[-MAX_HISTORY:]:
-                    history[tf].append(deserialize_candle(item))
-                order_blocks[tf] = [
-                    OrderBlock(**b) for b in payload.get("order_blocks", {}).get(tf, [])
-                ][-40:]
-            last_alert.clear()
-            last_alert.update({k: float(v) for k, v in payload.get("last_alert", {}).items()})
-            saved_structure = payload.get("structure_state", {})
-            for tf in TIMEFRAMES:
-                st = saved_structure.get(tf, {})
-                last_pivot_high[tf] = st.get("last_pivot_high")
-                last_pivot_low[tf] = st.get("last_pivot_low")
-                trend_state[tf] = int(st.get("trend", 0))
-                high_period = st.get("last_pivot_high_period")
-                low_period = st.get("last_pivot_low_period")
-                last_pivot_high_candle[tf] = next((x for x in history[tf] if x.period == high_period), None)
-                last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
-        log.info("Stato ripristinato da %s", STATE_FILE)
+        if STATE_DB.exists():
+            with sqlite3.connect(STATE_DB) as db:
+                row = db.execute("SELECT payload FROM state WHERE id=1").fetchone()
+            if row:
+                restore_payload(json.loads(row[0]))
+                log.info("Stato ripristinato da %s", STATE_DB)
+                return True
     except Exception as exc:
-        log.warning("Impossibile ripristinare lo stato: %s", exc)
+        log.warning("Impossibile ripristinare SQLite: %s", exc)
+
+    if STATE_FILE.exists():
+        try:
+            payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            restore_payload(payload)
+            log.info("Stato migrato da %s", STATE_FILE)
+            save_state()
+            return True
+        except Exception as exc:
+            log.warning("Impossibile ripristinare lo stato JSON: %s", exc)
+    return False
 
 def persistence_worker():
     while not shutdown_event.wait(PERSIST_EVERY_SECONDS):
         save_state()
+
+def _bootstrap_1m_candles():
+    if not BOOTSTRAP_ENABLED:
+        return []
+    end_ts = int(time.time())
+    start_ts = end_ts - BOOTSTRAP_LOOKBACK_MINUTES * 60
+    url = "https://finnhub.io/api/v1/forex/candle"
+    params = {
+        "symbol": SYMBOL,
+        "resolution": BOOTSTRAP_RESOLUTION,
+        "from": start_ts,
+        "to": end_ts,
+        "token": FINNHUB_TOKEN,
+    }
+    r = requests.get(url, params=params, timeout=(5, 20))
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok":
+        raise RuntimeError(f"Finnhub bootstrap response: {data.get('s')}")
+    result = []
+    count = min(len(data.get("t", [])), len(data.get("o", [])), len(data.get("h", [])), len(data.get("l", [])), len(data.get("c", [])))
+    volumes = data.get("v", [])
+    for i in range(count):
+        ts = float(data["t"][i])
+        vol = float(volumes[i]) if i < len(volumes) and volumes[i] not in (None, 0) else 1.0
+        result.append(Candle(
+            period=int(ts // 60), timestamp=ts,
+            open=float(data["o"][i]), high=float(data["h"][i]), low=float(data["l"][i]),
+            close=float(data["c"][i]), volume=vol, tick_count=max(1, int(vol) if vol < 100000 else 1),
+            profile={float(data["c"][i]): vol},
+        ))
+    return result
+
+def _aggregate_bootstrap(base_candles, seconds):
+    buckets = {}
+    for c in base_candles:
+        period = int(c.timestamp // seconds)
+        b = buckets.get(period)
+        if b is None:
+            b = Candle(period, c.timestamp, c.open, c.high, c.low, c.close, c.volume, c.tick_count, dict(c.profile))
+            buckets[period] = b
+        else:
+            b.high = max(b.high, c.high)
+            b.low = min(b.low, c.low)
+            b.close = c.close
+            b.volume += c.volume
+            b.tick_count += c.tick_count
+            for price, vol in c.profile.items():
+                b.profile[price] = b.profile.get(price, 0.0) + vol
+    return [buckets[k] for k in sorted(buckets)]
+
+def bootstrap_history():
+    global bootstrap_completed, bootstrap_error
+    if not BOOTSTRAP_ENABLED:
+        bootstrap_completed = True
+        return
+    try:
+        base = _bootstrap_1m_candles()
+        if not base:
+            raise RuntimeError("nessuna candela storica ricevuta")
+
+        with state_lock:
+            for tf, seconds in TIMEFRAMES.items():
+                aggregated = _aggregate_bootstrap(base, seconds)
+                # Only closed candles: the newest bucket can still be in progress.
+                current_period = int(time.time() // seconds)
+                closed = [x for x in aggregated if x.period < current_period][-MAX_HISTORY:]
+                if len(history[tf]) < len(closed):
+                    history[tf].clear()
+                    history[tf].extend(closed)
+                    order_blocks[tf].clear()
+                    last_pivot_high[tf] = None
+                    last_pivot_low[tf] = None
+                    last_pivot_high_candle[tf] = None
+                    last_pivot_low_candle[tf] = None
+                    trend_state[tf] = 0
+                    # Replay structural state without emitting Telegram alerts.
+                    old_show = globals()["SHOW_MANIPULATION_BUBBLES"]
+                    globals()["SHOW_MANIPULATION_BUBBLES"] = False
+                    try:
+                        replay = list(history[tf])
+                        history[tf].clear()
+                        for candle in replay:
+                            invalidate_blocks(tf, candle)
+                            detect_structure_break(tf, candle)
+                            history[tf].append(candle)
+                            detect_new_pivots(tf)
+                    finally:
+                        globals()["SHOW_MANIPULATION_BUBBLES"] = old_show
+
+        bootstrap_completed = True
+        bootstrap_error = None
+        save_state()
+        log.info("Bootstrap storico completato: %s candele M1", len(base))
+    except Exception as exc:
+        bootstrap_error = str(exc)
+        log.warning("Bootstrap storico non disponibile: %s", exc)
 
 def on_open(ws):
     global last_connection_time, ws_connected
@@ -696,15 +834,19 @@ def health_snapshot():
         closed = {tf: len(history[tf]) for tf in TIMEFRAMES}
         ready = {tf: len(history[tf]) >= max(VOLUME_LOOKBACK, ATR_LENGTH + 1, PIVOT_LENGTH * 2 + 1) for tf in TIMEFRAMES}
     if last_tick_time is None:
-        status = "starting"
+        feed_status = "starting"
     elif tick_age is not None and tick_age > STALE_AFTER_SECONDS:
-        status = "feed_stale"
+        feed_status = "feed_stale"
     elif not ws_connected:
-        status = "disconnected"
+        feed_status = "disconnected"
     else:
-        status = "online"
+        feed_status = "online"
+
+    all_ready = all(ready.values())
     return {
-        "status": status,
+        "status": "alive",
+        "ready_status": "ready" if all_ready and feed_status == "online" else "not_ready",
+        "feed_status": feed_status,
         "engine": "Lux-style Volumetric Manipulation Bubble Detector",
         "symbol": SYMBOL,
         "websocket_connected": ws_connected,
@@ -721,6 +863,10 @@ def health_snapshot():
         "closed_candles": closed,
         "ready": ready,
         "timeframes": list(TIMEFRAMES.keys()),
+        "bootstrap_enabled": BOOTSTRAP_ENABLED,
+        "bootstrap_completed": bootstrap_completed,
+        "bootstrap_error": bootstrap_error,
+        "state_db": str(STATE_DB),
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
     }
@@ -739,13 +885,23 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_HEAD(self):
+        path = self.path.split("?", 1)[0]
         snap = health_snapshot()
-        self.send_response(200 if snap["status"] in {"online", "starting"} else 503)
+        if path == "/ready":
+            self.send_response(200 if snap["ready_status"] == "ready" else 503)
+        else:
+            self.send_response(200)
         self.end_headers()
 
     def do_GET(self):
+        path = self.path.split("?", 1)[0]
         snap = health_snapshot()
-        self._send_json(200 if snap["status"] in {"online", "starting"} else 503, snap)
+        if path == "/ready":
+            self._send_json(200 if snap["ready_status"] == "ready" else 503, snap)
+        elif path in {"/", "/health"}:
+            self._send_json(200, snap)
+        else:
+            self._send_json(404, {"status": "not_found"})
 
 def health_server():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
@@ -754,7 +910,12 @@ def health_server():
 
 def main():
     validate_config()
-    load_state()
+    restored = load_state()
+    if not restored:
+        bootstrap_history()
+    else:
+        global bootstrap_completed
+        bootstrap_completed = True
     log.info(
         "Avvio XAU/USD bubble detector | Pivot=%s Lookback=%s Blocks=%s Sensitivity=%s",
         PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,
