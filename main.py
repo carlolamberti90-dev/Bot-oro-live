@@ -95,6 +95,30 @@ last_alert_time = None
 last_alert = {}
 ws_connected = False
 
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUDIT_FILE = Path(os.getenv("AUDIT_FILE", "bubble_audit.jsonl"))
+AUDIT_MAX_BYTES = int(os.getenv("AUDIT_MAX_BYTES", str(5 * 1024 * 1024)))
+audit_lock = threading.Lock()
+
+def audit_write(record):
+    if not AUDIT_ENABLED:
+        return
+    try:
+        line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
+        with audit_lock:
+            if AUDIT_FILE.exists() and AUDIT_FILE.stat().st_size >= AUDIT_MAX_BYTES:
+                rotated = AUDIT_FILE.with_suffix(AUDIT_FILE.suffix + ".1")
+                try:
+                    if rotated.exists():
+                        rotated.unlink()
+                    AUDIT_FILE.replace(rotated)
+                except OSError:
+                    pass
+            with AUDIT_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception as exc:
+        log.warning("Audit bubble non disponibile: %s", exc)
+
 def validate_config():
     missing = []
     if not FINNHUB_TOKEN:
