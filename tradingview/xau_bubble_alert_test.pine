@@ -1,0 +1,105 @@
+// Test harness derived from user-supplied LuxAlgo Pine logic.
+// Purpose: verify that the exact manipulation-bubble conditions can emit TradingView alerts.
+//@version=6
+indicator("XAU Bubble Alert Test", overlay=true)
+
+pivotLenInput = input.int(3, "Pivot Length", minval=1)
+volLookbackInput = input.int(22, "Volume Lookback", minval=1)
+maxObsInput = input.int(4, "Max Recent Blocks", minval=1)
+hideOverlappingInput = input.bool(true, "Hide Overlapping Blocks")
+manipSizeInput = input.float(2.5, "Bubble Sensitivity", minval=0.1)
+
+type OrderBlock
+    float high
+    float low
+    float volume
+    bool isBullish
+
+var int trend = 0
+var activeObs = array.new<OrderBlock>()
+
+ph = ta.pivothigh(pivotLenInput, pivotLenInput)
+pl = ta.pivotlow(pivotLenInput, pivotLenInput)
+
+var float lastPh = na
+var int lastPhIdx = na
+var float lastPl = na
+var int lastPlIdx = na
+
+if not na(ph)
+    lastPh := ph
+    lastPhIdx := bar_index - pivotLenInput
+
+if not na(pl)
+    lastPl := pl
+    lastPlIdx := bar_index - pivotLenInput
+
+draw_structure(int startIdx, bool isBullish) =>
+    pHigh = high[bar_index - startIdx]
+    pLow = low[bar_index - startIdx]
+    pVol = volume[bar_index - startIdx]
+
+    overlappingIndices = array.new_int()
+    if hideOverlappingInput and array.size(activeObs) > 0
+        for i = 0 to array.size(activeObs) - 1
+            ob = array.get(activeObs, i)
+            if pLow < ob.high and pHigh > ob.low
+                array.push(overlappingIndices, i)
+
+    shouldDraw = true
+    if array.size(overlappingIndices) > 0
+        for idx in overlappingIndices
+            existingOb = array.get(activeObs, idx)
+            if pVol <= existingOb.volume
+                shouldDraw := false
+                break
+
+        if shouldDraw
+            array.sort(overlappingIndices, order.descending)
+            for idx in overlappingIndices
+                array.remove(activeObs, idx)
+
+    if shouldDraw
+        array.push(activeObs, OrderBlock.new(pHigh, pLow, pVol, isBullish))
+        if array.size(activeObs) > maxObsInput
+            array.shift(activeObs)
+
+isCrossover = ta.crossover(close, lastPh)
+isCrossunder = ta.crossunder(close, lastPl)
+
+if not na(lastPh) and isCrossover
+    draw_structure(lastPhIdx, true)
+    trend := 1
+    lastPh := na
+
+if not na(lastPl) and isCrossunder
+    draw_structure(lastPlIdx, false)
+    trend := -1
+    lastPl := na
+
+bool raidHighAny = false
+bool raidLowAny = false
+
+if array.size(activeObs) > 0
+    for i = array.size(activeObs) - 1 to 0
+        ob = array.get(activeObs, i)
+        mitigated = ob.isBullish ? close < ob.low : close > ob.high
+        if mitigated
+            array.remove(activeObs, i)
+        else
+            raidHigh = not ob.isBullish and high > ob.high and close <= ob.high
+            raidLow = ob.isBullish and low < ob.low and close >= ob.low
+            raidHighAny := raidHighAny or raidHigh
+            raidLowAny := raidLowAny or raidLow
+
+plotshape(raidHighAny, title="Manipulation Bubble SHORT", style=shape.circle, location=location.abovebar, size=size.tiny, text="S")
+plotshape(raidLowAny, title="Manipulation Bubble LONG", style=shape.circle, location=location.belowbar, size=size.tiny, text="L")
+
+alertcondition(raidHighAny, title="Manipulation Bubble SHORT", message='{"type":"manipulation_bubble","direction":"SHORT","ticker":"{{ticker}}","interval":"{{interval}}","close":"{{close}}","time":"{{time}}"}')
+alertcondition(raidLowAny, title="Manipulation Bubble LONG", message='{"type":"manipulation_bubble","direction":"LONG","ticker":"{{ticker}}","interval":"{{interval}}","close":"{{close}}","time":"{{time}}"}')
+
+// Optional dynamic alerts, useful if user chooses "Any alert() function call".
+if barstate.isconfirmed and raidHighAny
+    alert('{"type":"manipulation_bubble","direction":"SHORT","ticker":"' + syminfo.tickerid + '","interval":"' + timeframe.period + '","close":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+if barstate.isconfirmed and raidLowAny
+    alert('{"type":"manipulation_bubble","direction":"LONG","ticker":"' + syminfo.tickerid + '","interval":"' + timeframe.period + '","close":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
