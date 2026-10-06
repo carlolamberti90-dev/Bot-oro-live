@@ -131,13 +131,29 @@ def telegram_worker():
                         timeout=(5, 10),
                     )
                     if r.ok:
+                        audit_write({
+                            "type": "telegram_sent",
+                            "sent_at": time.time(),
+                            "telegram_status": r.status_code,
+                        })
                         log.info("Bubble inviata su Telegram.")
                         break
                     retryable = r.status_code == 429 or r.status_code >= 500
+                    audit_write({
+                        "type": "telegram_error",
+                        "error_at": time.time(),
+                        "telegram_status": r.status_code,
+                        "response": r.text[:300],
+                    })
                     log.error("Telegram HTTP %s: %s", r.status_code, r.text[:300])
                     if not retryable:
                         break
                 except requests.RequestException as exc:
+                    audit_write({
+                        "type": "telegram_network_error",
+                        "error_at": time.time(),
+                        "error": str(exc),
+                    })
                     log.error("Errore rete Telegram: %s", exc)
                 if attempt < 3:
                     time.sleep(2 ** attempt)
@@ -304,6 +320,21 @@ def detect_manipulation_bubble(tf, candle):
         else:
             detected = candle.high > block.high and candle.close <= block.high
             direction = "SHORT"
+        if detected:
+            audit_write({
+                "type": "candidate",
+                "detected_at": time.time(),
+                "tf": tf,
+                "direction": direction,
+                "price": candle.close,
+                "zone_high": block.high,
+                "zone_low": block.low,
+                "poc": block.poc,
+                "relative_volume": rvol,
+                "volume": candle.volume,
+                "block_id": block.block_id,
+                "candle_period": candle.period,
+            })
         if detected and alert_allowed(tf, direction, block.block_id):
             enqueue_bubble(BubbleEvent(
                 tf=tf,
@@ -375,8 +406,21 @@ def bubble_aggregator():
             pass
         if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
             pending.sort(key=lambda e: tf_order.get(e.tf, 999))
-            enqueue_telegram(build_multi_tf_message(pending))
+            message = build_multi_tf_message(pending)
+            enqueue_telegram(message)
             last_alert_time = time.time()
+            audit_write({
+                "type": "telegram_enqueued",
+                "enqueued_at": last_alert_time,
+                "events": [
+                    {
+                        "tf": e.tf, "direction": e.direction, "price": e.price,
+                        "zone_high": e.zone_high, "zone_low": e.zone_low,
+                        "poc": e.poc, "relative_volume": e.relative_volume,
+                        "volume": e.volume, "block_id": e.block_id,
+                    } for e in pending
+                ],
+            })
             log.info("Bubble confermate: %s", ", ".join(f"{e.tf}-{e.direction}" for e in pending))
             pending = []
             first_time = None
@@ -584,6 +628,7 @@ def health_snapshot():
         "closed_candles": closed,
         "ready": ready,
         "timeframes": list(TIMEFRAMES.keys()),
+        "audit_file": str(AUDIT_FILE),
     }
 
 class HealthHandler(BaseHTTPRequestHandler):
