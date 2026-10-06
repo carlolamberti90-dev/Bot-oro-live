@@ -1,948 +1,478 @@
 import os
 import json
 import time
-import math
 import queue
 import logging
 import threading
 import collections
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import websocket
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-log = logging.getLogger("xau-bubble-bot")
-
-
-# ============================================================
-# CONFIGURAZIONE
-# ============================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("xau-lux-bubble")
 
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
+SYMBOL = os.getenv("FINNHUB_SYMBOL", "OANDA:XAU_USD").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-SYMBOL = os.getenv(
-    "FINNHUB_SYMBOL",
-    "OANDA:XAU_USD",
-).strip()
+# Parametri uguali allo screenshot LuxAlgo dell'utente
+PIVOT_LENGTH = 3
+VOLUME_LOOKBACK = 22
+MAX_RECENT_BLOCKS = 4
+BUBBLE_SENSITIVITY = 2.5
+PROFILE_ROWS = 15
+ATR_LENGTH = 14
+HIDE_OVERLAPPING_BLOCKS = True
+SHOW_MANIPULATION_BUBBLES = True
 
-# Bubble detector
-PIVOT_LOOKBACK = int(os.getenv("PIVOT_LOOKBACK", "10"))
-MIN_HISTORY = int(os.getenv("MIN_HISTORY", "20"))
-HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "150"))
-
-ZSCORE_THRESHOLD = float(
-    os.getenv("ZSCORE_THRESHOLD", "2.0")
-)
-
-IMBALANCE_THRESHOLD = float(
-    os.getenv("IMBALANCE_THRESHOLD", "3.0")
-)
-
-# Impedisce raffiche dello stesso segnale
-ALERT_COOLDOWN_SECONDS = int(
-    os.getenv("ALERT_COOLDOWN_SECONDS", "300")
-)
-
-# Se Finnhub restituisce volume=0 utilizziamo tick-volume.
-USE_TICK_VOLUME_FALLBACK = (
-    os.getenv("USE_TICK_VOLUME_FALLBACK", "true")
-    .lower()
-    in ("1", "true", "yes", "on")
-)
-
+# Raggruppa eventi quasi contemporanei, senza sopprimere timeframe diversi.
+MULTI_TF_WINDOW_SECONDS = 3.0
+# Evita il duplicato della stessa zona sullo stesso timeframe.
+SAME_BUBBLE_COOLDOWN_SECONDS = 300
+MAX_HISTORY = 300
+USE_TICK_VOLUME_FALLBACK = True
 
 TIMEFRAMES = {
-    "M1": 60,
-    "M3": 180,
-    "M5": 300,
-    "M15": 900,
-    "M30": 1800,
-    "H1": 3600,
-    "H4": 14400,
-    "D1": 86400,
+    "M1": 60, "M3": 180, "M5": 300, "M15": 900,
+    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
 }
 
-
-# ============================================================
-# VALIDAZIONE
-# ============================================================
-
-def validate_config():
-    missing = []
-
-    if not FINNHUB_TOKEN:
-        missing.append("FINNHUB_TOKEN")
-
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if missing:
-        raise RuntimeError(
-            "Variabili Render mancanti: "
-            + ", ".join(missing)
-        )
-
-    if PIVOT_LOOKBACK < 2:
-        raise RuntimeError(
-            "PIVOT_LOOKBACK deve essere >= 2"
-        )
-
-    if MIN_HISTORY < 5:
-        raise RuntimeError(
-            "MIN_HISTORY deve essere >= 5"
-        )
-
-    if ZSCORE_THRESHOLD <= 0:
-        raise RuntimeError(
-            "ZSCORE_THRESHOLD deve essere > 0"
-        )
-
-    if IMBALANCE_THRESHOLD <= 1:
-        raise RuntimeError(
-            "IMBALANCE_THRESHOLD deve essere > 1"
-        )
-
-
-# ============================================================
-# DATI CANDELA
-# ============================================================
-
+@dataclass
 class Candle:
-    def __init__(self):
-        self.period = None
+    period: int
+    timestamp: float
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    tick_count: int = 0
+    # (prezzo, volume) per ricostruire il profilo a 15 righe a candela chiusa.
+    samples: list = field(default_factory=list)
 
-        self.open = None
-        self.high = None
-        self.low = None
-        self.close = None
+@dataclass
+class OrderBlock:
+    block_id: str
+    high: float
+    low: float
+    volume: float
+    bullish: bool
+    poc: float
+    created_period: int
+    active: bool = True
 
-        self.buy_volume = 0.0
-        self.sell_volume = 0.0
+@dataclass
+class BubbleEvent:
+    tf: str
+    direction: str
+    price: float
+    zone_high: float
+    zone_low: float
+    poc: float
+    relative_volume: float
+    volume: float
+    timestamp: float
+    block_id: str
 
-        self.tick_count = 0
-        self.real_volume_seen = False
-
-        self.alerted = False
-
-    @property
-    def total_volume(self):
-        return self.buy_volume + self.sell_volume
-
-    @property
-    def delta(self):
-        return self.buy_volume - self.sell_volume
-
-
-candles = {
-    tf: Candle()
-    for tf in TIMEFRAMES
-}
-
-
-volume_history = {
-    tf: collections.deque(maxlen=HISTORY_SIZE)
-    for tf in TIMEFRAMES
-}
-
-high_history = {
-    tf: collections.deque(maxlen=PIVOT_LOOKBACK)
-    for tf in TIMEFRAMES
-}
-
-low_history = {
-    tf: collections.deque(maxlen=PIVOT_LOOKBACK)
-    for tf in TIMEFRAMES
-}
-
-
-# ============================================================
-# STATO
-# ============================================================
+current_candles = {tf: None for tf in TIMEFRAMES}
+history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
+order_blocks = {tf: [] for tf in TIMEFRAMES}
 
 state_lock = threading.RLock()
-
-telegram_queue = queue.Queue(maxsize=100)
+telegram_queue = queue.Queue(maxsize=200)
+bubble_queue = queue.Queue(maxsize=200)
+shutdown_event = threading.Event()
 
 last_price = None
 last_tick_time = None
 last_connection_time = None
-
 last_alert = {}
 
-shutdown_event = threading.Event()
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
+def validate_config():
+    missing = []
+    if not FINNHUB_TOKEN:
+        missing.append("FINNHUB_TOKEN")
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise RuntimeError("Variabili Render mancanti: " + ", ".join(missing))
 
 def telegram_url():
-    return (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
-
+    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 def enqueue_telegram(message):
-    """
-    Telegram viene usato SOLO per bubble confermate.
-    Nessun messaggio ONLINE.
-    Nessun messaggio di reconnect.
-    """
-
     try:
         telegram_queue.put_nowait(message)
-
     except queue.Full:
-        log.error(
-            "Coda Telegram piena: alert scartato."
-        )
-
+        log.error("Coda Telegram piena: alert scartato.")
 
 def telegram_worker():
     session = requests.Session()
-
     while not shutdown_event.is_set():
-
         try:
             message = telegram_queue.get(timeout=1)
-
         except queue.Empty:
             continue
-
         try:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            }
-
-            response = session.post(
+            r = session.post(
                 telegram_url(),
-                json=payload,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
                 timeout=(5, 10),
             )
-
-            if response.ok:
-                log.info(
-                    "Bubble inviata su Telegram."
-                )
-
+            if r.ok:
+                log.info("Bubble inviata su Telegram.")
             else:
-                log.error(
-                    "Telegram HTTP %s: %s",
-                    response.status_code,
-                    response.text[:300],
-                )
-
+                log.error("Telegram HTTP %s: %s", r.status_code, r.text[:300])
         except requests.RequestException as exc:
-            log.error(
-                "Errore rete Telegram: %s",
-                exc,
-            )
-
+            log.error("Errore rete Telegram: %s", exc)
         except Exception:
-            log.exception(
-                "Errore inatteso Telegram."
-            )
-
+            log.exception("Errore inatteso Telegram.")
         finally:
             telegram_queue.task_done()
 
+def calculate_poc(candle):
+    if not candle.samples or candle.high <= candle.low:
+        return candle.close
+    width = (candle.high - candle.low) / PROFILE_ROWS
+    rows = [0.0] * PROFILE_ROWS
+    for price, volume in candle.samples:
+        idx = int((price - candle.low) / width)
+        idx = max(0, min(PROFILE_ROWS - 1, idx))
+        rows[idx] += volume
+    poc_row = max(range(PROFILE_ROWS), key=lambda i: rows[i])
+    return candle.low + width * (poc_row + 0.5)
 
-# ============================================================
-# STATISTICA
-# ============================================================
-
-def volume_zscore(tf, current_volume):
-    history = volume_history[tf]
-
-    if len(history) < MIN_HISTORY:
+def calculate_atr(tf):
+    candles = list(history[tf])
+    if len(candles) < ATR_LENGTH + 1:
         return None
+    recent = candles[-(ATR_LENGTH + 1):]
+    trs = []
+    for i in range(1, len(recent)):
+        c, prev = recent[i], recent[i - 1]
+        trs.append(max(c.high - c.low, abs(c.high - prev.close), abs(c.low - prev.close)))
+    return sum(trs) / len(trs) if trs else None
 
-    mean = sum(history) / len(history)
+def relative_volume(tf, current_volume):
+    candles = list(history[tf])
+    if len(candles) < VOLUME_LOOKBACK:
+        return 1.0
+    sample = candles[-VOLUME_LOOKBACK:]
+    avg = sum(c.volume for c in sample) / len(sample)
+    return current_volume / avg if avg > 0 else 1.0
 
-    variance = sum(
-        (x - mean) ** 2
-        for x in history
-    ) / len(history)
-
-    std = math.sqrt(variance)
-
-    if std <= 0:
-        return 0.0
-
-    return (
-        current_volume - mean
-    ) / std
-
-
-def imbalance_ratio(candle):
-    buy = candle.buy_volume
-    sell = candle.sell_volume
-
-    if buy <= 0 and sell <= 0:
-        return 0.0
-
-    if buy <= 0 or sell <= 0:
-        return float("inf")
-
-    return max(
-        buy / sell,
-        sell / buy,
+def is_pivot_high(candles, index):
+    center = candles[index].high
+    return all(
+        candles[i].high < center
+        for i in range(index - PIVOT_LENGTH, index + PIVOT_LENGTH + 1)
+        if i != index
     )
 
+def is_pivot_low(candles, index):
+    center = candles[index].low
+    return all(
+        candles[i].low > center
+        for i in range(index - PIVOT_LENGTH, index + PIVOT_LENGTH + 1)
+        if i != index
+    )
 
-def delta_percent(candle):
-    total = candle.total_volume
+def zones_overlap(a, b):
+    return not (a.high < b.low or a.low > b.high)
 
-    if total <= 0:
-        return 0.0
+def add_order_block(tf, pivot_candle, bullish):
+    atr = calculate_atr(tf)
+    if atr is None:
+        return
+    candle_range = pivot_candle.high - pivot_candle.low
+    if candle_range <= 0:
+        return
 
-    return (
-        candle.delta / total
-    ) * 100.0
+    # ATR limita zone anormalmente spesse senza alterare il pivot.
+    zone_range = min(candle_range, atr * 1.5)
+    if bullish:
+        low = pivot_candle.low
+        high = min(pivot_candle.high, low + zone_range)
+    else:
+        high = pivot_candle.high
+        low = max(pivot_candle.low, high - zone_range)
 
+    block = OrderBlock(
+        block_id=f"{tf}-{pivot_candle.period}-{'B' if bullish else 'S'}",
+        high=high,
+        low=low,
+        volume=pivot_candle.volume,
+        bullish=bullish,
+        poc=calculate_poc(pivot_candle),
+        created_period=pivot_candle.period,
+    )
 
-# ============================================================
-# COOLDOWN ALERT
-# ============================================================
+    blocks = order_blocks[tf]
+    if HIDE_OVERLAPPING_BLOCKS:
+        for old in blocks:
+            if old.active and zones_overlap(old, block):
+                if old.volume >= block.volume:
+                    return
+                old.active = False
 
-def alert_allowed(tf, direction):
-    key = f"{tf}:{direction}"
+    blocks.append(block)
+    active = sorted((b for b in blocks if b.active), key=lambda b: b.created_period)
+    while len(active) > MAX_RECENT_BLOCKS:
+        active.pop(0).active = False
 
+def detect_new_pivots(tf):
+    candles = list(history[tf])
+    required = PIVOT_LENGTH * 2 + 1
+    if len(candles) < required:
+        return
+    index = len(candles) - PIVOT_LENGTH - 1
+    if index < PIVOT_LENGTH:
+        return
+    pivot = candles[index]
+    if is_pivot_high(candles, index):
+        add_order_block(tf, pivot, bullish=False)
+    if is_pivot_low(candles, index):
+        add_order_block(tf, pivot, bullish=True)
+
+def invalidate_blocks(tf, candle):
+    for block in order_blocks[tf]:
+        if not block.active:
+            continue
+        if block.bullish and candle.close < block.low:
+            block.active = False
+        elif (not block.bullish) and candle.close > block.high:
+            block.active = False
+
+def alert_allowed(tf, direction, block_id):
+    key = f"{tf}:{direction}:{block_id}"
     now = time.time()
-
-    previous = last_alert.get(key, 0)
-
-    if (
-        now - previous
-        < ALERT_COOLDOWN_SECONDS
-    ):
+    if now - last_alert.get(key, 0) < SAME_BUBBLE_COOLDOWN_SECONDS:
         return False
-
     last_alert[key] = now
-
     return True
 
+def enqueue_bubble(event):
+    try:
+        bubble_queue.put_nowait(event)
+    except queue.Full:
+        log.error("Coda bubble piena: evento scartato.")
 
-# ============================================================
-# BUBBLE SIZE / CONFIDENCE
-# ============================================================
+def detect_manipulation_bubble(tf, candle):
+    if not SHOW_MANIPULATION_BUBBLES:
+        return
+    rvol = relative_volume(tf, candle.volume)
 
-def bubble_size(zscore):
-    if zscore >= 4.0:
+    for block in [b for b in order_blocks[tf] if b.active]:
+        # Demand: wick sotto la zona, chiusura di nuovo dentro/sopra => LONG verde.
+        if block.bullish:
+            detected = candle.low < block.low and candle.close >= block.low
+            direction = "LONG"
+        else:
+            # Supply: wick sopra la zona, chiusura di nuovo dentro/sotto => SHORT rosso.
+            detected = candle.high > block.high and candle.close <= block.high
+            direction = "SHORT"
+
+        if detected and alert_allowed(tf, direction, block.block_id):
+            enqueue_bubble(BubbleEvent(
+                tf=tf,
+                direction=direction,
+                price=candle.close,
+                zone_high=block.high,
+                zone_low=block.low,
+                poc=block.poc,
+                relative_volume=rvol,
+                volume=candle.volume,
+                timestamp=time.time(),
+                block_id=block.block_id,
+            ))
+
+def bubble_strength(rvol):
+    # Sensitivity regola la risposta della dimensione, non elimina il raid.
+    scaled = rvol * BUBBLE_SENSITIVITY
+    if scaled >= 7.5:
         return "EXTREME"
-
-    if zscore >= 3.0:
+    if scaled >= 5.0:
         return "LARGE"
+    if scaled >= 2.5:
+        return "MEDIUM"
+    return "SMALL"
 
-    return "MEDIUM"
-
-
-def confidence_score(
-    zscore,
-    imbalance,
-    sweep_strength,
-):
-    z_component = min(
-        max(zscore / 4.0, 0),
-        1,
-    )
-
-    if math.isinf(imbalance):
-        imbalance_component = 1.0
+def format_event(event):
+    if event.direction == "SHORT":
+        icon, raid = "🔴🫧", "Buy-side liquidity raid"
     else:
-        imbalance_component = min(
-            imbalance / 5.0,
-            1,
-        )
-
-    sweep_component = min(
-        max(sweep_strength, 0),
-        1,
-    )
-
-    score = (
-        z_component * 0.45
-        + imbalance_component * 0.35
-        + sweep_component * 0.20
-    )
-
-    return max(
-        0,
-        min(100, round(score * 100)),
-    )
-
-
-# ============================================================
-# FORMATTA ALERT
-# ============================================================
-
-def build_alert(
-    tf,
-    candle,
-    direction,
-    liquidity_level,
-    zscore,
-    imbalance,
-    confidence,
-    volume_mode,
-):
-    if direction == "LONG":
-        icon = "🔴🫧"
-        bubble_type = "BULLISH MANIPULATION BUBBLE"
-        sweep = "SELL-SIDE LIQUIDITY SWEEP"
-
-    else:
-        icon = "🟢🫧"
-        bubble_type = "BEARISH MANIPULATION BUBBLE"
-        sweep = "BUY-SIDE LIQUIDITY SWEEP"
-
-    ratio = (
-        "∞"
-        if math.isinf(imbalance)
-        else f"{imbalance:.2f}x"
-    )
-
+        icon, raid = "🟢🫧", "Sell-side liquidity raid"
     return (
-        f"{icon} VOLUMETRIC BUBBLE DETECTED\n\n"
-        f"XAU/USD | {tf}\n\n"
-
-        f"{bubble_type}\n"
-        f"{sweep}\n\n"
-
-        f"Prezzo: {candle.close:.3f}\n"
-        f"Livello liquidità: {liquidity_level:.3f}\n\n"
-
-        f"VOLUMETRIC DATA\n"
-        f"Buy Volume: {candle.buy_volume:.2f}\n"
-        f"Sell Volume: {candle.sell_volume:.2f}\n"
-        f"Delta: {candle.delta:+.2f}\n"
-        f"Delta %: {delta_percent(candle):+.1f}%\n"
-        f"Imbalance: {ratio}\n"
-        f"Volume Z-Score: {zscore:.2f}\n\n"
-
-        f"Bubble Size: {bubble_size(zscore)}\n"
-        f"Bias: {direction}\n"
-        f"Confidence: {confidence}/100\n\n"
-
-        f"Volume source: {volume_mode}"
+        f"{icon} {event.tf} — {event.direction}\n"
+        f"Prezzo: {event.price:.3f}\n"
+        f"Zona: {event.zone_low:.3f} - {event.zone_high:.3f}\n"
+        f"POC: {event.poc:.3f}\n"
+        f"Relative Volume: {event.relative_volume:.2f}x\n"
+        f"Volume: {event.volume:.2f}\n"
+        f"Bubble: {bubble_strength(event.relative_volume)}\n"
+        f"{raid}"
     )
 
+def build_multi_tf_message(events):
+    directions = {e.direction for e in events}
+    if len(directions) == 1:
+        direction = events[0].direction
+        icon = "🔴🫧" if direction == "SHORT" else "🟢🫧"
+        header = f"{icon} VOLUMETRIC MANIPULATION BUBBLE — {direction}"
+    else:
+        header = "🟡🫧 VOLUMETRIC BUBBLES — MIXED"
 
-# ============================================================
-# CHIUSURA CANDELA
-# ============================================================
+    parts = [header, "", "XAU/USD", ""]
+    if len(events) > 1:
+        parts += ["MULTI-TIMEFRAME: " + " • ".join(e.tf for e in events), ""]
+    for event in events:
+        parts += [format_event(event), ""]
+    return "\n".join(parts).rstrip()
 
-def store_closed_candle(tf, candle):
-    if candle.open is None:
-        return
+def bubble_aggregator():
+    pending = []
+    first_time = None
+    tf_order = {tf: i for i, tf in enumerate(TIMEFRAMES)}
+    while not shutdown_event.is_set():
+        try:
+            event = bubble_queue.get(timeout=0.25)
+            pending.append(event)
+            bubble_queue.task_done()
+            if first_time is None:
+                first_time = time.time()
+        except queue.Empty:
+            pass
 
-    volume_history[tf].append(
-        candle.total_volume
+        if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
+            pending.sort(key=lambda e: tf_order.get(e.tf, 999))
+            enqueue_telegram(build_multi_tf_message(pending))
+            log.info("Bubble confermate: %s", ", ".join(f"{e.tf}-{e.direction}" for e in pending))
+            pending = []
+            first_time = None
+
+def new_candle(period, timestamp, price, volume):
+    return Candle(
+        period=period, timestamp=timestamp,
+        open=price, high=price, low=price, close=price,
+        volume=volume, tick_count=1, samples=[(price, volume)],
     )
 
-    high_history[tf].append(
-        candle.high
-    )
+def close_candle(tf, candle):
+    # Il raid è confermato solo quando conosciamo il close della candela.
+    detect_manipulation_bubble(tf, candle)
+    history[tf].append(candle)
+    invalidate_blocks(tf, candle)
+    detect_new_pivots(tf)
 
-    low_history[tf].append(
-        candle.low
-    )
-
-
-# ============================================================
-# NUOVA CANDELA
-# ============================================================
-
-def reset_candle(
-    candle,
-    period,
-    price,
-    volume,
-    buy_side,
-    real_volume,
-):
-    candle.period = period
-
-    candle.open = price
-    candle.high = price
-    candle.low = price
-    candle.close = price
-
-    candle.buy_volume = (
-        volume if buy_side else 0.0
-    )
-
-    candle.sell_volume = (
-        0.0 if buy_side else volume
-    )
-
-    candle.tick_count = 1
-
-    candle.real_volume_seen = real_volume
-
-    candle.alerted = False
-
-
-# ============================================================
-# DETECTOR BUBBLE
-# ============================================================
-
-def detect_bubble(tf, candle):
-    if candle.alerted:
-        return
-
-    if (
-        len(high_history[tf])
-        < PIVOT_LOOKBACK
-    ):
-        return
-
-    if (
-        len(low_history[tf])
-        < PIVOT_LOOKBACK
-    ):
-        return
-
-    liquidity_high = max(
-        high_history[tf]
-    )
-
-    liquidity_low = min(
-        low_history[tf]
-    )
-
-    zscore = volume_zscore(
-        tf,
-        candle.total_volume,
-    )
-
-    if zscore is None:
-        return
-
-    if zscore < ZSCORE_THRESHOLD:
-        return
-
-    imbalance = imbalance_ratio(candle)
-
-    if imbalance < IMBALANCE_THRESHOLD:
-        return
-
-    direction = None
-    liquidity_level = None
-    sweep_strength = 0.0
-
-    candle_range = max(
-        candle.high - candle.low,
-        0.000001,
-    )
-
-    # --------------------------------------------------------
-    # Sweep sopra i massimi + rientro
-    # --------------------------------------------------------
-
-    if (
-        candle.high > liquidity_high
-        and candle.close <= liquidity_high
-    ):
-        direction = "SHORT"
-
-        liquidity_level = liquidity_high
-
-        sweep_strength = min(
-            (
-                candle.high
-                - liquidity_high
-            )
-            / candle_range,
-            1.0,
-        )
-
-    # --------------------------------------------------------
-    # Sweep sotto i minimi + rientro
-    # --------------------------------------------------------
-
-    elif (
-        candle.low < liquidity_low
-        and candle.close >= liquidity_low
-    ):
-        direction = "LONG"
-
-        liquidity_level = liquidity_low
-
-        sweep_strength = min(
-            (
-                liquidity_low
-                - candle.low
-            )
-            / candle_range,
-            1.0,
-        )
-
-    if direction is None:
-        return
-
-    if not alert_allowed(
-        tf,
-        direction,
-    ):
-        return
-
-    confidence = confidence_score(
-        zscore,
-        imbalance,
-        sweep_strength,
-    )
-
-    volume_mode = (
-        "Finnhub volume"
-        if candle.real_volume_seen
-        else "tick-volume proxy"
-    )
-
-    candle.alerted = True
-
-    message = build_alert(
-        tf=tf,
-        candle=candle,
-        direction=direction,
-        liquidity_level=liquidity_level,
-        zscore=zscore,
-        imbalance=imbalance,
-        confidence=confidence,
-        volume_mode=volume_mode,
-    )
-
-    log.info(
-        "BUBBLE %s %s @ %.3f | Z=%.2f",
-        tf,
-        direction,
-        candle.close,
-        zscore,
-    )
-
-    enqueue_telegram(message)
-
-
-# ============================================================
-# MARKET FLOW
-# ============================================================
-
-def process_tick(
-    price,
-    raw_volume,
-    timestamp_ms,
-):
-    global last_price
-    global last_tick_time
-
+def process_tick(price, raw_volume, timestamp_ms):
+    global last_price, last_tick_time
     try:
         price = float(price)
         raw_volume = float(raw_volume or 0)
         timestamp_ms = int(timestamp_ms)
-
     except (TypeError, ValueError):
         return
-
     if price <= 0:
         return
 
-    real_volume = raw_volume > 0
-
-    if real_volume:
-        volume = raw_volume
-
-    elif USE_TICK_VOLUME_FALLBACK:
-        volume = 1.0
-
-    else:
+    volume = raw_volume if raw_volume > 0 else (1.0 if USE_TICK_VOLUME_FALLBACK else 0.0)
+    if volume <= 0:
         return
-
-    timestamp_sec = (
-        timestamp_ms / 1000.0
-    )
+    timestamp = timestamp_ms / 1000.0
 
     with state_lock:
-
         last_tick_time = time.time()
-
-        if last_price is None:
-            last_price = price
-            return
-
-        # Tick rule:
-        # prezzo crescente = lato buy
-        # prezzo decrescente = lato sell
-        #
-        # Questo è un proxy, non un vero
-        # aggressor bid/ask Level-2.
-
-        buy_side = price >= last_price
-
         last_price = price
-
         for tf, seconds in TIMEFRAMES.items():
-            candle = candles[tf]
-
-            period = int(
-                timestamp_sec // seconds
-            )
-
-            if candle.period is None:
-                reset_candle(
-                    candle,
-                    period,
-                    price,
-                    volume,
-                    buy_side,
-                    real_volume,
-                )
+            period = int(timestamp // seconds)
+            candle = current_candles[tf]
+            if candle is None:
+                current_candles[tf] = new_candle(period, timestamp, price, volume)
                 continue
-
             if period > candle.period:
-                store_closed_candle(
-                    tf,
-                    candle,
-                )
-
-                reset_candle(
-                    candle,
-                    period,
-                    price,
-                    volume,
-                    buy_side,
-                    real_volume,
-                )
-
+                close_candle(tf, candle)
+                current_candles[tf] = new_candle(period, timestamp, price, volume)
                 continue
-
+            # Ignora eventuali trade fuori ordine appartenenti a periodi già chiusi.
+            if period < candle.period:
+                continue
             candle.close = price
+            candle.high = max(candle.high, price)
+            candle.low = min(candle.low, price)
+            candle.volume += volume
             candle.tick_count += 1
-
-            if price > candle.high:
-                candle.high = price
-
-            if price < candle.low:
-                candle.low = price
-
-            if buy_side:
-                candle.buy_volume += volume
-            else:
-                candle.sell_volume += volume
-
-            if real_volume:
-                candle.real_volume_seen = True
-
-            detect_bubble(
-                tf,
-                candle,
-            )
-
-
-# ============================================================
-# FINNHUB CALLBACKS
-# ============================================================
+            candle.samples.append((price, volume))
 
 def on_open(ws):
     global last_connection_time
-
     last_connection_time = time.time()
-
-    payload = {
-        "type": "subscribe",
-        "symbol": SYMBOL,
-    }
-
-    ws.send(
-        json.dumps(payload)
-    )
-
-    # SOLO LOG. NIENTE TELEGRAM.
-    log.info(
-        "Finnhub connesso: %s",
-        SYMBOL,
-    )
-
+    ws.send(json.dumps({"type": "subscribe", "symbol": SYMBOL}))
+    log.info("Finnhub connesso: %s", SYMBOL)  # solo log, mai Telegram
 
 def on_message(ws, message):
     try:
         payload = json.loads(message)
-
     except json.JSONDecodeError:
-        log.warning(
-            "Messaggio Finnhub non JSON."
-        )
         return
-
-    if payload.get("type") == "ping":
-        return
-
     if payload.get("type") == "error":
-        log.error(
-            "Finnhub error: %s",
-            payload,
-        )
+        log.error("Finnhub error: %s", payload)
         return
-
     if payload.get("type") != "trade":
         return
-
-    trades = payload.get(
-        "data",
-        [],
-    )
-
-    for trade in trades:
-        if trade.get("s") != SYMBOL:
-            continue
-
-        process_tick(
-            trade.get("p"),
-            trade.get("v", 0),
-            trade.get("t"),
-        )
-
+    for trade in payload.get("data", []):
+        if trade.get("s") == SYMBOL:
+            process_tick(trade.get("p"), trade.get("v", 0), trade.get("t"))
 
 def on_error(ws, error):
-    # SOLO LOG.
-    log.error(
-        "WebSocket: %s",
-        error,
-    )
+    log.error("WebSocket: %s", error)
 
-
-def on_close(
-    ws,
-    status_code,
-    message,
-):
-    # SOLO LOG.
-    log.warning(
-        "Finnhub disconnesso | code=%s | %s",
-        status_code,
-        message,
-    )
-
-
-# ============================================================
-# WEBSOCKET LOOP
-# ============================================================
+def on_close(ws, status_code, message):
+    log.warning("Finnhub disconnesso | code=%s | %s", status_code, message)
 
 def websocket_loop():
     delay = 2
-
     while not shutdown_event.is_set():
-
+        opened_at = None
         try:
             ws = websocket.WebSocketApp(
-                (
-                    "wss://ws.finnhub.io"
-                    f"?token={FINNHUB_TOKEN}"
-                ),
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
+                f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
+                on_open=on_open, on_message=on_message,
+                on_error=on_error, on_close=on_close,
             )
-
-            ws.run_forever(
-                ping_interval=30,
-                ping_timeout=10,
-            )
-
-            # Se run_forever termina,
-            # aspettiamo prima di riconnetterci.
-
+            opened_at = time.time()
+            ws.run_forever(ping_interval=30, ping_timeout=10)
         except KeyboardInterrupt:
             shutdown_event.set()
             break
-
         except Exception:
-            log.exception(
-                "Errore WebSocket."
-            )
+            log.exception("Errore WebSocket.")
 
         if shutdown_event.is_set():
             break
-
-        log.warning(
-            "Riconnessione Finnhub tra %ss.",
-            delay,
-        )
-
-        time.sleep(delay)
-
-        # Exponential backoff fino a 60 sec.
-        delay = min(
-            delay * 2,
-            60,
-        )
-
-        # Se la connessione precedente è durata
-        # abbastanza, ripartiamo da 2 secondi.
-        if (
-            last_connection_time
-            and time.time()
-            - last_connection_time > 120
-        ):
+        # Se la sessione è stata stabile, riparte dal backoff minimo.
+        if opened_at and time.time() - opened_at > 120:
             delay = 2
+        log.warning("Riconnessione Finnhub tra %ss.", delay)
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
 
-
-# ============================================================
-# HEALTH SERVER RENDER
-# ============================================================
-
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
-    def log_message(
-        self,
-        format,
-        *args,
-    ):
+class HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
         return
 
-    def _send_json(
-        self,
-        status,
-        payload,
-    ):
-        body = json.dumps(
-            payload
-        ).encode("utf-8")
-
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            "application/json",
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-
         self.wfile.write(body)
 
     def do_HEAD(self):
@@ -951,75 +481,41 @@ class HealthHandler(
 
     def do_GET(self):
         now = time.time()
-
         with state_lock:
-            tick_age = (
-                None
-                if last_tick_time is None
-                else round(
-                    now - last_tick_time,
-                    1,
-                )
-            )
-
-        self._send_json(
-            200,
-            {
-                "status": "online",
-                "symbol": SYMBOL,
-                "last_tick_age_seconds": tick_age,
-                "telegram_queue": (
-                    telegram_queue.qsize()
-                ),
-                "timeframes": list(
-                    TIMEFRAMES.keys()
-                ),
-            },
-        )
-
+            tick_age = None if last_tick_time is None else round(now - last_tick_time, 1)
+            active = {tf: sum(1 for b in order_blocks[tf] if b.active) for tf in TIMEFRAMES}
+            closed = {tf: len(history[tf]) for tf in TIMEFRAMES}
+        self._send_json(200, {
+            "status": "online",
+            "engine": "Lux-style Volumetric Manipulation Bubble Detector",
+            "symbol": SYMBOL,
+            "last_tick_age_seconds": tick_age,
+            "pivot_length": PIVOT_LENGTH,
+            "volume_lookback": VOLUME_LOOKBACK,
+            "max_recent_blocks": MAX_RECENT_BLOCKS,
+            "bubble_sensitivity": BUBBLE_SENSITIVITY,
+            "profile_rows": PROFILE_ROWS,
+            "active_blocks": active,
+            "closed_candles": closed,
+            "timeframes": list(TIMEFRAMES.keys()),
+        })
 
 def health_server():
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler,
-    )
-
-    log.info(
-        "Health server 0.0.0.0:%s",
-        PORT,
-    )
-
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    log.info("Health server 0.0.0.0:%s", PORT)
     server.serve_forever()
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     validate_config()
-
     log.info(
-        "Avvio XAU/USD Volumetric Bubble Detector."
+        "Avvio XAU/USD bubble detector | Pivot=%s Lookback=%s Blocks=%s Sensitivity=%s",
+        PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,
     )
-
-    # NESSUN MESSAGGIO TELEGRAM DI AVVIO.
-
-    threading.Thread(
-        target=telegram_worker,
-        name="telegram-worker",
-        daemon=True,
-    ).start()
-
-    threading.Thread(
-        target=health_server,
-        name="health-server",
-        daemon=True,
-    ).start()
-
-    # Il WebSocket resta nel thread principale.
+    # Telegram resta completamente silenzioso all'avvio/reconnect.
+    threading.Thread(target=telegram_worker, name="telegram-worker", daemon=True).start()
+    threading.Thread(target=bubble_aggregator, name="bubble-aggregator", daemon=True).start()
+    threading.Thread(target=health_server, name="health-server", daemon=True).start()
     websocket_loop()
-
 
 if __name__ == "__main__":
     main()
