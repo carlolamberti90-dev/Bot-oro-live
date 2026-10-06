@@ -25,13 +25,14 @@ STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "180"))
 PERSIST_EVERY_SECONDS = int(os.getenv("PERSIST_EVERY_SECONDS", "60"))
 
 PIVOT_LENGTH = 3
-VOLUME_LOOKBACK = 22
-MAX_RECENT_BLOCKS = 4
-BUBBLE_SENSITIVITY = 2.5
+VOLUME_LOOKBACK = 22  # user setting; LuxAlgo source default is 20
+MAX_RECENT_BLOCKS = 4  # user setting; LuxAlgo source default is 5
+BUBBLE_SENSITIVITY = 2.5  # user setting; LuxAlgo source default is 1.0
 PROFILE_ROWS = 15
 ATR_LENGTH = 14
 HIDE_OVERLAPPING_BLOCKS = True
 SHOW_MANIPULATION_BUBBLES = True
+MAX_VOLUME_LOOKBACK = 200
 MULTI_TF_WINDOW_SECONDS = 3.0
 SAME_BUBBLE_COOLDOWN_SECONDS = 300
 MAX_HISTORY = 300
@@ -75,6 +76,7 @@ class BubbleEvent:
     zone_low: float
     poc: float
     relative_volume: float
+    bubble_scale: float
     volume: float
     timestamp: float
     block_id: str
@@ -82,6 +84,11 @@ class BubbleEvent:
 current_candles = {tf: None for tf in TIMEFRAMES}
 history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
 order_blocks = {tf: [] for tf in TIMEFRAMES}
+last_pivot_high = {tf: None for tf in TIMEFRAMES}
+last_pivot_low = {tf: None for tf in TIMEFRAMES}
+last_pivot_high_candle = {tf: None for tf in TIMEFRAMES}
+last_pivot_low_candle = {tf: None for tf in TIMEFRAMES}
+trend_state = {tf: 0 for tf in TIMEFRAMES}
 
 state_lock = threading.RLock()
 telegram_queue = queue.Queue(maxsize=200)
@@ -231,6 +238,11 @@ def relative_volume(tf, current_volume):
     avg = sum(c.volume for c in sample) / len(sample)
     return current_volume / avg if avg > 0 else 1.0
 
+def max_volume_lookback(tf, current_volume=0.0):
+    candles = list(history[tf])[-MAX_VOLUME_LOOKBACK:]
+    max_vol = max((c.volume for c in candles), default=0.0)
+    return max(max_vol, current_volume, 1.0)
+
 def is_pivot_high(candles, index):
     center = candles[index].high
     return all(
@@ -257,24 +269,15 @@ def prune_blocks(tf):
     order_blocks[tf] = inactive + active[-MAX_RECENT_BLOCKS:]
 
 def add_order_block(tf, pivot_candle, bullish):
-    atr = calculate_atr(tf)
-    if atr is None:
+    # LuxAlgo structure uses the full pivot candle range for the block.
+    # ATR is used only for structure-line visuals in the Pine source, not to clip OB height.
+    if pivot_candle.high <= pivot_candle.low:
         return
-    candle_range = pivot_candle.high - pivot_candle.low
-    if candle_range <= 0:
-        return
-    zone_range = min(candle_range, atr * 1.5)
-    if bullish:
-        low = pivot_candle.low
-        high = min(pivot_candle.high, low + zone_range)
-    else:
-        high = pivot_candle.high
-        low = max(pivot_candle.low, high - zone_range)
 
     block = OrderBlock(
         block_id=f"{tf}-{pivot_candle.period}-{'B' if bullish else 'S'}",
-        high=high,
-        low=low,
+        high=pivot_candle.high,
+        low=pivot_candle.low,
         volume=pivot_candle.volume,
         bullish=bullish,
         poc=calculate_poc(pivot_candle),
@@ -283,10 +286,13 @@ def add_order_block(tf, pivot_candle, bullish):
 
     blocks = order_blocks[tf]
     if HIDE_OVERLAPPING_BLOCKS:
-        for old in blocks:
-            if old.active and zones_overlap(old, block):
-                if old.volume >= block.volume:
-                    return
+        overlapping = [b for b in blocks if b.active and zones_overlap(b, block)]
+        if overlapping:
+            # LuxAlgo: only draw the new block if its pivot volume is strictly larger
+            # than every overlapping active block; then remove all overlaps.
+            if any(block.volume <= old.volume for old in overlapping):
+                return
+            for old in overlapping:
                 old.active = False
 
     blocks.append(block)
@@ -303,11 +309,38 @@ def detect_new_pivots(tf):
     index = len(candles) - PIVOT_LENGTH - 1
     if index < PIVOT_LENGTH:
         return
+
     pivot = candles[index]
     if is_pivot_high(candles, index):
-        add_order_block(tf, pivot, bullish=False)
+        last_pivot_high[tf] = pivot.high
+        last_pivot_high_candle[tf] = pivot
     if is_pivot_low(candles, index):
-        add_order_block(tf, pivot, bullish=True)
+        last_pivot_low[tf] = pivot.low
+        last_pivot_low_candle[tf] = pivot
+
+def detect_structure_break(tf, candle):
+    # Pine source: ta.crossover(close, lastPh) / ta.crossunder(close, lastPl).
+    if len(history[tf]) == 0:
+        return
+    prev_close = history[tf][-1].close
+
+    ph = last_pivot_high[tf]
+    if ph is not None and prev_close <= ph < candle.close:
+        pivot_candle = last_pivot_high_candle[tf]
+        if pivot_candle is not None:
+            add_order_block(tf, pivot_candle, bullish=True)
+        trend_state[tf] = 1
+        last_pivot_high[tf] = None
+        last_pivot_high_candle[tf] = None
+
+    pl = last_pivot_low[tf]
+    if pl is not None and prev_close >= pl > candle.close:
+        pivot_candle = last_pivot_low_candle[tf]
+        if pivot_candle is not None:
+            add_order_block(tf, pivot_candle, bullish=False)
+        trend_state[tf] = -1
+        last_pivot_low[tf] = None
+        last_pivot_low_candle[tf] = None
 
 def invalidate_blocks(tf, candle):
     for block in order_blocks[tf]:
@@ -336,14 +369,20 @@ def enqueue_bubble(event):
 def detect_manipulation_bubble(tf, candle):
     if not SHOW_MANIPULATION_BUBBLES:
         return
+
     rvol = relative_volume(tf, candle.volume)
+    max_vol = max_volume_lookback(tf, candle.volume)
+    bubble_scale = (candle.volume / max_vol) * BUBBLE_SENSITIVITY
+
     for block in [b for b in order_blocks[tf] if b.active]:
+        # Exact Pine raid conditions.
         if block.bullish:
             detected = candle.low < block.low and candle.close >= block.low
             direction = "LONG"
         else:
             detected = candle.high > block.high and candle.close <= block.high
             direction = "SHORT"
+
         if detected:
             audit_write({
                 "type": "candidate",
@@ -355,10 +394,12 @@ def detect_manipulation_bubble(tf, candle):
                 "zone_low": block.low,
                 "poc": block.poc,
                 "relative_volume": rvol,
+                "bubble_scale": bubble_scale,
                 "volume": candle.volume,
                 "block_id": block.block_id,
                 "candle_period": candle.period,
             })
+
         if detected and alert_allowed(tf, direction, block.block_id):
             enqueue_bubble(BubbleEvent(
                 tf=tf,
@@ -368,20 +409,24 @@ def detect_manipulation_bubble(tf, candle):
                 zone_low=block.low,
                 poc=block.poc,
                 relative_volume=rvol,
+                bubble_scale=bubble_scale,
                 volume=candle.volume,
                 timestamp=time.time(),
                 block_id=block.block_id,
             ))
 
-def bubble_strength(rvol):
-    scaled = rvol * BUBBLE_SENSITIVITY
-    if scaled >= 7.5:
-        return "EXTREME"
-    if scaled >= 5.0:
+def bubble_strength(scale):
+    # Mirrors Pine bubble-size thresholds: >0.8 huge, >0.6 large,
+    # >0.4 normal, >0.2 small, else tiny.
+    if scale > 0.8:
+        return "HUGE"
+    if scale > 0.6:
         return "LARGE"
-    if scaled >= 2.5:
-        return "MEDIUM"
-    return "SMALL"
+    if scale > 0.4:
+        return "NORMAL"
+    if scale > 0.2:
+        return "SMALL"
+    return "TINY"
 
 def format_event(event):
     if event.direction == "SHORT":
@@ -395,7 +440,8 @@ def format_event(event):
         f"POC: {event.poc:.3f}\n"
         f"Relative Volume: {event.relative_volume:.2f}x\n"
         f"Volume: {event.volume:.2f}\n"
-        f"Bubble: {bubble_strength(event.relative_volume)}\n"
+        f"Bubble Scale: {event.bubble_scale:.2f}\n"
+        f"Bubble: {bubble_strength(event.bubble_scale)}\n"
         f"{raid}"
     )
 
@@ -441,6 +487,7 @@ def bubble_aggregator():
                         "tf": e.tf, "direction": e.direction, "price": e.price,
                         "zone_high": e.zone_high, "zone_low": e.zone_low,
                         "poc": e.poc, "relative_volume": e.relative_volume,
+                        "bubble_scale": e.bubble_scale,
                         "volume": e.volume, "block_id": e.block_id,
                     } for e in pending
                 ],
@@ -459,9 +506,11 @@ def new_candle(period, timestamp, price, volume):
     return c
 
 def close_candle(tf, candle):
+    # Existing blocks are updated first, matching Pine's execution order.
     detect_manipulation_bubble(tf, candle)
-    history[tf].append(candle)
     invalidate_blocks(tf, candle)
+    detect_structure_break(tf, candle)
+    history[tf].append(candle)
     detect_new_pivots(tf)
 
 def process_tick(price, raw_volume, timestamp_ms):
@@ -537,6 +586,15 @@ def save_state():
                 for tf in TIMEFRAMES
             },
             "last_alert": last_alert,
+            "structure_state": {
+                tf: {
+                    "last_pivot_high": last_pivot_high[tf],
+                    "last_pivot_low": last_pivot_low[tf],
+                    "last_pivot_high_period": None if last_pivot_high_candle[tf] is None else last_pivot_high_candle[tf].period,
+                    "last_pivot_low_period": None if last_pivot_low_candle[tf] is None else last_pivot_low_candle[tf].period,
+                    "trend": trend_state[tf],
+                } for tf in TIMEFRAMES
+            },
         }
     try:
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -559,6 +617,16 @@ def load_state():
                 ][-40:]
             last_alert.clear()
             last_alert.update({k: float(v) for k, v in payload.get("last_alert", {}).items()})
+            saved_structure = payload.get("structure_state", {})
+            for tf in TIMEFRAMES:
+                st = saved_structure.get(tf, {})
+                last_pivot_high[tf] = st.get("last_pivot_high")
+                last_pivot_low[tf] = st.get("last_pivot_low")
+                trend_state[tf] = int(st.get("trend", 0))
+                high_period = st.get("last_pivot_high_period")
+                low_period = st.get("last_pivot_low_period")
+                last_pivot_high_candle[tf] = next((x for x in history[tf] if x.period == high_period), None)
+                last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
         log.info("Stato ripristinato da %s", STATE_FILE)
     except Exception as exc:
         log.warning("Impossibile ripristinare lo stato: %s", exc)
@@ -648,6 +716,7 @@ def health_snapshot():
         "max_recent_blocks": MAX_RECENT_BLOCKS,
         "bubble_sensitivity": BUBBLE_SENSITIVITY,
         "profile_rows": PROFILE_ROWS,
+        "max_volume_lookback": MAX_VOLUME_LOOKBACK,
         "active_blocks": active,
         "closed_candles": closed,
         "ready": ready,
