@@ -14,6 +14,8 @@ class DetectorTests(unittest.TestCase):
             main.last_pivot_low_candle[tf] = None
             main.trend_state[tf] = 0
         main.last_alert.clear()
+        main.bootstrap_completed = False
+        main.bootstrap_error = None
 
     def candle(self, period, o=100, h=101, l=99, c=100, v=10):
         x = main.Candle(period, period * 60, o, h, l, c, v, 10)
@@ -76,6 +78,36 @@ class DetectorTests(unittest.TestCase):
             main.detect_manipulation_bubble(tf, raid)
             event = enqueue.call_args.args[0]
             self.assertAlmostEqual(event.bubble_scale, main.BUBBLE_SENSITIVITY)
+
+    def test_bootstrap_aggregation_builds_higher_timeframe(self):
+        base = [
+            self.candle(0, o=100, h=101, l=99, c=100, v=2),
+            self.candle(1, o=100, h=102, l=100, c=101, v=3),
+            self.candle(2, o=101, h=103, l=100, c=102, v=4),
+        ]
+        base[0].timestamp = 0
+        base[1].timestamp = 60
+        base[2].timestamp = 120
+        agg = main._aggregate_bootstrap(base, 180)
+        self.assertEqual(len(agg), 1)
+        self.assertEqual(agg[0].open, 100)
+        self.assertEqual(agg[0].high, 103)
+        self.assertEqual(agg[0].low, 99)
+        self.assertEqual(agg[0].close, 102)
+        self.assertEqual(agg[0].volume, 9)
+
+    def test_health_endpoint_model_is_alive_when_feed_stale(self):
+        with patch.object(main, "last_tick_time", main.time.time() - (main.STALE_AFTER_SECONDS + 10)),              patch.object(main, "ws_connected", False):
+            snap = main.health_snapshot()
+            self.assertEqual(snap["status"], "alive")
+            self.assertIn(snap["feed_status"], {"feed_stale", "disconnected"})
+
+    def test_state_payload_includes_current_candle(self):
+        tf = "M1"
+        main.current_candles[tf] = self.candle(123)
+        payload = main.state_payload()
+        self.assertIsNotNone(payload["current_candles"][tf])
+        self.assertEqual(payload["current_candles"][tf]["period"], 123)
 
     def test_prune_bounds_inactive_blocks(self):
         tf = "M1"
