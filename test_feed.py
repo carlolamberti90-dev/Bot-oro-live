@@ -30,7 +30,8 @@ class FeedTests(unittest.TestCase):
 
     def test_socket_connection_is_not_feed_confirmation(self):
         ws = Mock()
-        main.on_open(ws)
+        with patch.object(main, "recover_history"):
+            main.on_open(ws)
         self.assertFalse(main.health_snapshot()['subscription_verified'])
         self.assertEqual(main.health_snapshot()['status'], 'starting')
 

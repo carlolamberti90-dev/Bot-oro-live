@@ -1,3 +1,5 @@
+# Closed-bar logic adapted from © LuxAlgo Volumetric Order Flow Structure.
+# CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
 import os
 import json
 import time
@@ -56,6 +58,7 @@ class Candle:
     tick_count: int = 0
     # Quantized price-volume map. Bounds memory versus storing every tick forever.
     profile: dict = field(default_factory=dict)
+    complete: bool = True
 
 @dataclass
 class OrderBlock:
@@ -81,6 +84,10 @@ class BubbleEvent:
     volume: float
     timestamp: float
     block_id: str
+
+confirmations = {}
+history_status = {tf: "not_checked" for tf in TIMEFRAMES}
+history_retry_after = 0
 
 current_candles = {tf: None for tf in TIMEFRAMES}
 history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
@@ -244,18 +251,21 @@ def profile_add(candle, price, volume):
         candle.profile[round(candle.close, 3)] = candle.profile.get(round(candle.close, 3), 0.0) + merged_volume
 
 def calculate_poc(candle):
-    if not candle.profile or candle.high <= candle.low:
+    # Pine uses synthetic row weights from the pivot candle body, not tick volume.
+    if candle.high <= candle.low:
         return candle.close
-    width = (candle.high - candle.low) / PROFILE_ROWS
-    if width <= 0:
-        return candle.close
-    rows = [0.0] * PROFILE_ROWS
-    for price, volume in candle.profile.items():
-        idx = int((price - candle.low) / width)
-        idx = max(0, min(PROFILE_ROWS - 1, idx))
-        rows[idx] += volume
-    poc_row = max(range(PROFILE_ROWS), key=lambda i: rows[i])
-    return candle.low + width * (poc_row + 0.5)
+    step = (candle.high - candle.low) / PROFILE_ROWS
+    body_high, body_low = max(candle.open, candle.close), min(candle.open, candle.close)
+    weights = []
+    for i in range(PROFILE_ROWS):
+        top = candle.high - i * step
+        bottom = top - step
+        weight = int(max(2, 12 - abs(i - PROFILE_ROWS / 2.0) * 1.5))
+        if body_low <= top <= body_high or body_low <= bottom <= body_high:
+            weight += 5
+        weights.append(weight)
+    row = max(range(PROFILE_ROWS), key=lambda i: weights[i])
+    return candle.high - step * (row + 0.5)
 
 def calculate_atr(tf):
     candles = list(history[tf])
@@ -284,7 +294,7 @@ def max_volume_lookback(tf, current_volume=0.0):
 def is_pivot_high(candles, index):
     center = candles[index].high
     return all(
-        candles[i].high < center
+        candles[i].high <= center if i < index else candles[i].high < center
         for i in range(index - PIVOT_LENGTH, index + PIVOT_LENGTH + 1)
         if i != index
     )
@@ -292,13 +302,13 @@ def is_pivot_high(candles, index):
 def is_pivot_low(candles, index):
     center = candles[index].low
     return all(
-        candles[i].low > center
+        candles[i].low >= center if i < index else candles[i].low > center
         for i in range(index - PIVOT_LENGTH, index + PIVOT_LENGTH + 1)
         if i != index
     )
 
 def zones_overlap(a, b):
-    return not (a.high < b.low or a.low > b.high)
+    return a.low < b.high and a.high > b.low
 
 def prune_blocks(tf):
     blocks = order_blocks[tf]
@@ -339,8 +349,8 @@ def add_order_block(tf, pivot_candle, bullish):
         active.pop(0).active = False
     prune_blocks(tf)
 
-def detect_new_pivots(tf):
-    candles = list(history[tf])
+def detect_new_pivots(tf, current=None):
+    candles = list(history[tf]) + ([current] if current is not None else [])
     required = PIVOT_LENGTH * 2 + 1
     if len(candles) < required:
         return
@@ -356,14 +366,14 @@ def detect_new_pivots(tf):
         last_pivot_low[tf] = pivot.low
         last_pivot_low_candle[tf] = pivot
 
-def detect_structure_break(tf, candle):
+def detect_structure_break(tf, candle, previous_high=None, previous_low=None):
     # Pine source: ta.crossover(close, lastPh) / ta.crossunder(close, lastPl).
     if len(history[tf]) == 0:
         return
     prev_close = history[tf][-1].close
 
     ph = last_pivot_high[tf]
-    if ph is not None and prev_close <= ph < candle.close:
+    if ph is not None and previous_high is not None and prev_close <= previous_high and candle.close > ph:
         pivot_candle = last_pivot_high_candle[tf]
         if pivot_candle is not None:
             add_order_block(tf, pivot_candle, bullish=True)
@@ -372,7 +382,7 @@ def detect_structure_break(tf, candle):
         last_pivot_high_candle[tf] = None
 
     pl = last_pivot_low[tf]
-    if pl is not None and prev_close >= pl > candle.close:
+    if pl is not None and previous_low is not None and prev_close >= previous_low and candle.close < pl:
         pivot_candle = last_pivot_low_candle[tf]
         if pivot_candle is not None:
             add_order_block(tf, pivot_candle, bullish=False)
@@ -389,16 +399,28 @@ def invalidate_blocks(tf, candle):
         elif (not block.bullish) and candle.close > block.high:
             block.active = False
     prune_blocks(tf)
+    event = confirmations.get(tf)
+    if event is not None and ((event.direction == "LONG" and candle.close < event.zone_low)
+                              or (event.direction == "SHORT" and candle.close > event.zone_high)):
+        confirmations.pop(tf, None)
 
 def alert_allowed(tf, direction, block_id):
-    key = f"{tf}:{direction}:{block_id}"
+    current = current_candles[tf]
+    period = current.period if current is not None else int(time.time() // TIMEFRAMES[tf])
+    key = f"{tf}:{direction}:{period}"
     now = time.time()
     if now - last_alert.get(key, 0) < SAME_BUBBLE_COOLDOWN_SECONDS:
         return False
     last_alert[key] = now
+    for old_key, sent_at in list(last_alert.items()):
+        if now - sent_at > 86400:
+            last_alert.pop(old_key, None)
     return True
 
 def enqueue_bubble(event):
+    if event.tf in {"M3", "M5"}:
+        with state_lock:
+            confirmations[event.tf] = event
     try:
         bubble_queue.put_nowait(event)
     except queue.Full:
@@ -449,7 +471,7 @@ def detect_manipulation_bubble(tf, candle):
                 relative_volume=rvol,
                 bubble_scale=bubble_scale,
                 volume=candle.volume,
-                timestamp=time.time(),
+                timestamp=(candle.period + 1) * TIMEFRAMES[tf],
                 block_id=block.block_id,
             ))
 
@@ -498,13 +520,21 @@ def build_multi_tf_message(events):
         parts += [format_event(event), ""]
     return "\n".join(parts).rstrip()
 
-def filter_m1_confirmation(events):
-    """M1 requires M3 AND M5 of the same direction in this aggregation batch."""
-    confirmations = {}
-    for event in events:
-        confirmations.setdefault(event.direction, set()).add(event.tf)
-    return [event for event in events if event.tf != "M1"
-            or {"M3", "M5"}.issubset(confirmations[event.direction])]
+def filter_m1_confirmation(events, now=None):
+    """Each higher-TF confirmation expires at its NEXT candle close."""
+    now = time.time() if now is None else now
+    with state_lock:
+        for event in events:
+            if event.tf in {"M3", "M5"}:
+                confirmations[event.tf] = event
+        for tf, event in list(confirmations.items()):
+            expiry = (int(event.timestamp // TIMEFRAMES[tf]) + 1) * TIMEFRAMES[tf]
+            if now >= expiry:
+                confirmations.pop(tf, None)
+        return [event for event in events if event.tf != "M1" or all(
+            tf in confirmations and confirmations[tf].direction == event.direction
+            and confirmations[tf].timestamp <= event.timestamp
+            for tf in ("M3", "M5"))]
 
 def bubble_aggregator():
     global last_alert_time
@@ -524,7 +554,7 @@ def bubble_aggregator():
             original_count = len(pending)
             pending = filter_m1_confirmation(pending)
             if len(pending) < original_count:
-                log.info("M1 scartato: manca tripla conferma M1/M3/M5 nella stessa direzione.")
+                log.info("M1 scartato: mancano conferme M3/M5 concordi e ancora valide.")
             if not pending:
                 first_time = None
                 continue
@@ -558,13 +588,15 @@ def new_candle(period, timestamp, price, volume):
     profile_add(c, price, volume)
     return c
 
-def close_candle(tf, candle):
-    # Existing blocks are updated first, matching Pine's execution order.
-    detect_manipulation_bubble(tf, candle)
+def close_candle(tf, candle, notify=True):
+    # Pine confirms pivots BEFORE checking ta.crossover against the previous series value.
+    previous_high, previous_low = last_pivot_high[tf], last_pivot_low[tf]
+    detect_new_pivots(tf, candle)
+    if notify:
+        detect_manipulation_bubble(tf, candle)
     invalidate_blocks(tf, candle)
-    detect_structure_break(tf, candle)
+    detect_structure_break(tf, candle, previous_high, previous_low)
     history[tf].append(candle)
-    detect_new_pivots(tf)
 
 def process_tick(price, raw_volume, timestamp_ms):
     global last_price, last_tick_time
@@ -589,10 +621,18 @@ def process_tick(price, raw_volume, timestamp_ms):
             candle = current_candles[tf]
             if candle is None:
                 current_candles[tf] = new_candle(period, timestamp, price, volume)
+                current_candles[tf].complete = False
                 continue
             if period > candle.period:
-                close_candle(tf, candle)
+                if candle.complete:
+                    close_candle(tf, candle)
+                else:
+                    log.info("Candela parziale scartata: %s", tf)
                 current_candles[tf] = new_candle(period, timestamp, price, volume)
+                if period > candle.period + 1:
+                    history_status[tf] = "gap_unrecovered"
+                    confirmations.clear()
+                    current_candles[tf].complete = False
                 continue
             if period < candle.period:
                 continue
@@ -688,11 +728,100 @@ def persistence_worker():
     while not shutdown_event.wait(PERSIST_EVERY_SECONDS):
         save_state()
 
+def parse_forex_candles(payload, seconds, cutoff):
+    if not isinstance(payload, dict) or payload.get("s") != "ok":
+        raise ValueError("no_candles")
+    columns = [payload.get(key) for key in ("t", "o", "h", "l", "c", "v")]
+    if not all(isinstance(col, list) for col in columns) or len({len(col) for col in columns}) != 1:
+        raise ValueError("invalid_candle_columns")
+    candles = []
+    for stamp, op, hi, lo, cl, vol in zip(*columns):
+        stamp = int(stamp)
+        values = [float(x) for x in (op, hi, lo, cl, vol)]
+        if not all(math.isfinite(x) for x in values) or not (0 < values[2] <= min(values[0], values[3]) <= max(values[0], values[3]) <= values[1]) or values[4] < 0:
+            raise ValueError("invalid_ohlcv")
+        if stamp + seconds <= cutoff:
+            candles.append(Candle(stamp // seconds, stamp, *values))
+    if any(b.timestamp <= a.timestamp for a, b in zip(candles, candles[1:])):
+        raise ValueError("non_chronological_candles")
+    return candles
+
+def aggregate_history(candles, source_seconds, target_seconds):
+    buckets = {}
+    for candle in candles:
+        buckets.setdefault(int(candle.timestamp // target_seconds), []).append(candle)
+    result = []
+    required = target_seconds // source_seconds
+    for period, group in sorted(buckets.items()):
+        start = period * target_seconds
+        if len(group) != required or [int(c.timestamp) for c in group] != list(range(start, start + target_seconds, source_seconds)):
+            continue
+        result.append(Candle(period, start, group[0].open, max(c.high for c in group),
+                             min(c.low for c in group), group[-1].close, sum(c.volume for c in group)))
+    return result
+
+def recover_history():
+    """Replay provider OHLCV silently; never invent candles for gaps."""
+    global history_retry_after
+    if time.time() < history_retry_after:
+        return
+    cutoff = int(time.time())
+    mapping = {"M1": ("1", 60), "M5": ("5", 300), "M15": ("15", 900),
+               "M30": ("30", 1800), "H1": ("60", 3600), "D1": ("D", 86400)}
+    retrieved = {}
+    try:
+        for tf, (resolution, seconds) in mapping.items():
+            multiplier = 4 if tf == "H1" else 3 if tf == "M1" else 1
+            lookback = seconds * MAX_HISTORY * multiplier * 2
+            response = requests.get("https://finnhub.io/api/v1/forex/candle",
+                params={"symbol": SYMBOL, "resolution": resolution, "from": cutoff - lookback, "to": cutoff},
+                headers={"X-Finnhub-Token": FINNHUB_TOKEN}, timeout=(5, 15))
+            if response.status_code in {401, 403}:
+                for name in TIMEFRAMES:
+                    history_status[name] = f"history_http_{response.status_code}"
+                history_retry_after = cutoff + 3600
+                log.error("Storico forex non accessibile: HTTP %s. Recupero non confermato; nessun dato inventato.", response.status_code)
+                return
+            if response.status_code != 200:
+                raise ValueError(f"history_http_{response.status_code}")
+            retrieved[tf] = parse_forex_candles(response.json(), seconds, cutoff)
+        retrieved["M3"] = aggregate_history(retrieved["M1"], 60, 180)
+        retrieved["H4"] = aggregate_history(retrieved["H1"], 3600, 14400)
+        with state_lock:
+            confirmations.clear()
+            for tf, candles in retrieved.items():
+                if len(candles) < 200:
+                    history_status[tf] = "insufficient_provider_history"
+                    continue
+                # A complete replay supersedes partial tick-built candles.
+                history[tf].clear()
+                order_blocks[tf] = []
+                last_pivot_high[tf] = last_pivot_low[tf] = None
+                last_pivot_high_candle[tf] = last_pivot_low_candle[tf] = None
+                trend_state[tf] = 0
+                for candle in candles[-MAX_HISTORY:]:
+                    close_candle(tf, candle, notify=False)
+                current_candles[tf] = None
+                history_status[tf] = "recovered_provider_ohlcv"
+                log.info("Storico recuperato senza alert: %s | %s candele", tf, len(history[tf]))
+        save_state()
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        history_retry_after = cutoff + 300
+        log.error("Recupero storico non riuscito; verifica continuita non completata.")
+        for tf in TIMEFRAMES:
+            if history_status[tf] == "not_checked":
+                history_status[tf] = "history_unavailable"
+
 def on_open(ws):
     global last_connection_time, ws_connected, subscription_verified
     ws_connected = True
     subscription_verified = False
     last_connection_time = time.time()
+    with state_lock:
+        confirmations.clear()
+        for candle in current_candles.values():
+            if candle is not None:
+                candle.complete = False
     ws.send(json.dumps({"type": "subscribe", "symbol": SYMBOL}))
     log.info("Socket Finnhub aperto; richiesta dati: %s (in attesa del primo prezzo)", SYMBOL)
 
@@ -735,6 +864,11 @@ def on_error(ws, error):
 def on_close(ws, status_code, message):
     global ws_connected
     ws_connected = False
+    with state_lock:
+        confirmations.clear()
+        for candle in current_candles.values():
+            if candle is not None:
+                candle.complete = False
     log.warning("Finnhub disconnesso | code=%s | %s", status_code, message)
 
 def websocket_loop():
@@ -743,6 +877,7 @@ def websocket_loop():
         if not resolve_symbol():
             shutdown_event.wait(60)
             continue
+        recover_history()
         started = time.time()
         try:
             ws = websocket.WebSocketApp(
@@ -804,7 +939,9 @@ def health_snapshot():
         "ready": ready,
         "timeframes": list(TIMEFRAMES.keys()),
         "m1_requires": ["M3", "M5"],
-        "confirmation_window_seconds": MULTI_TF_WINDOW_SECONDS,
+        "confirmation_validity": "until_next_M3_or_M5_candle_close",
+        "history_status": dict(history_status),
+        "parity_scope": "closed_bar_logic; upstream volume and session alignment require comparison",
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
     }
