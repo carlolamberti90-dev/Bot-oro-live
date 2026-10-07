@@ -47,6 +47,13 @@ class Improvements(unittest.TestCase):
         self.assertTrue(main.is_pivot_high(candles,3))
         candles[4].high=3
         self.assertFalse(main.is_pivot_high(candles,3))
+    def test_volume_window_includes_current_in_200_bars(self):
+        saved=list(main.history["M1"])
+        main.history["M1"].clear()
+        main.history["M1"].extend(main.Candle(i,i*60,100,102,99,101,1000 if i==0 else 10) for i in range(200))
+        try:self.assertEqual(main.max_volume_lookback("M1",20),20)
+        finally:
+            main.history["M1"].clear();main.history["M1"].extend(saved)
     def test_history_replay_silent(self):
         candle=main.Candle(0,0,100,102,99,101,10)
         with patch.object(main,'detect_manipulation_bubble') as detect:

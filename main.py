@@ -287,7 +287,7 @@ def relative_volume(tf, current_volume):
     return current_volume / avg if avg > 0 else 1.0
 
 def max_volume_lookback(tf, current_volume=0.0):
-    candles = list(history[tf])[-MAX_VOLUME_LOOKBACK:]
+    candles = list(history[tf])[-(MAX_VOLUME_LOOKBACK - 1):]
     max_vol = max((c.volume for c in candles), default=0.0)
     return max(max_vol, current_volume, 1.0)
 
