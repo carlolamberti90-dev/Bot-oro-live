@@ -8,6 +8,10 @@ import logging
 import threading
 import collections
 import math
+import copy
+import hashlib
+from datetime import datetime, time as daytime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,7 +40,7 @@ ATR_LENGTH = 14
 HIDE_OVERLAPPING_BLOCKS = True
 SHOW_MANIPULATION_BUBBLES = True
 MAX_VOLUME_LOOKBACK = 200
-MULTI_TF_WINDOW_SECONDS = 3.0
+MULTI_TF_WINDOW_SECONDS = 0.05
 SAME_BUBBLE_COOLDOWN_SECONDS = 300
 MAX_HISTORY = 300
 USE_TICK_VOLUME_FALLBACK = True
@@ -48,6 +52,15 @@ TIMEFRAMES = {
 
 def candle_period(tf, timestamp):
     # Weekly buckets begin Monday 00:00 UTC, rather than Unix epoch Thursday.
+    if tf == "H4":
+        instant = datetime.fromtimestamp(timestamp, timezone.utc)
+        ny = ZoneInfo("America/New_York")
+        date = instant.astimezone(ny).date()
+        anchor = datetime.combine(date, daytime(17), ny).astimezone(timezone.utc)
+        if instant < anchor:
+            anchor = datetime.combine(date - timedelta(days=1), daytime(17), ny).astimezone(timezone.utc)
+        start = anchor.timestamp() + int((timestamp - anchor.timestamp()) // 14400) * 14400
+        return int(start // 14400)
     offset = 3 * 86400 if tf == "W1" else 0
     return int((timestamp + offset) // TIMEFRAMES[tf])
 
@@ -89,7 +102,10 @@ class BubbleEvent:
     volume: float
     timestamp: float
     block_id: str
+    event_id: str = ""
+    feed_timestamp: float = 0.0
 
+committed_structure = {}
 confirmations = {}
 history_status = {tf: "not_checked" for tf in TIMEFRAMES}
 history_retry_after = 0
@@ -110,6 +126,7 @@ shutdown_event = threading.Event()
 
 last_price = None
 last_tick_time = None
+last_feed_timestamp = None
 last_connection_time = None
 last_alert_time = None
 last_alert = {}
@@ -190,9 +207,9 @@ def validate_config():
 def telegram_url():
     return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-def enqueue_telegram(message):
+def enqueue_telegram(message, event_ids=None):
     try:
-        telegram_queue.put_nowait(message)
+        telegram_queue.put_nowait({"text": message, "event_ids": event_ids or []})
     except queue.Full:
         log.error("Coda Telegram piena: alert scartato.")
 
@@ -200,7 +217,9 @@ def telegram_worker():
     session = requests.Session()
     while not shutdown_event.is_set():
         try:
-            message = telegram_queue.get(timeout=1)
+            job = telegram_queue.get(timeout=1)
+            message = job["text"] if isinstance(job, dict) else job
+            event_ids = job.get("event_ids", []) if isinstance(job, dict) else []
         except queue.Empty:
             continue
         try:
@@ -214,6 +233,7 @@ def telegram_worker():
                     if r.ok:
                         audit_write({
                             "type": "telegram_sent",
+                            "event_ids": event_ids,
                             "sent_at": time.time(),
                             "telegram_status": r.status_code,
                         })
@@ -412,13 +432,14 @@ def invalidate_blocks(tf, candle):
 def alert_allowed(tf, direction, block_id):
     current = current_candles[tf]
     period = current.period if current is not None else candle_period(tf, time.time())
-    key = f"{tf}:{direction}:{period}"
+    key = f"{tf}:{direction}:{period}:{block_id}"
     now = time.time()
-    if now - last_alert.get(key, 0) < SAME_BUBBLE_COOLDOWN_SECONDS:
+    if key in last_alert:
         return False
     last_alert[key] = now
-    for old_key, sent_at in list(last_alert.items()):
-        if now - sent_at > 86400:
+    # Keep identities for long candles (including weekly), bound memory by count.
+    if len(last_alert) > 10000:
+        for old_key in sorted(last_alert, key=last_alert.get)[:1000]:
             last_alert.pop(old_key, None)
     return True
 
@@ -484,6 +505,8 @@ def detect_manipulation_bubble(tf, candle):
                 volume=candle.volume,
                 timestamp=time.time(),
                 block_id=block.block_id,
+                event_id=hashlib.sha256(f"{tf}:{direction}:{candle.period}:{block.block_id}".encode()).hexdigest()[:20],
+                feed_timestamp=last_feed_timestamp or candle.timestamp,
             )
             if tf in {"M3", "M5"}:
                 confirmations[tf] = event
@@ -575,7 +598,7 @@ def bubble_aggregator():
                 continue
             pending.sort(key=lambda e: tf_order.get(e.tf, 999))
             message = build_multi_tf_message(pending)
-            enqueue_telegram(message)
+            enqueue_telegram(message, [event.event_id for event in pending])
             last_alert_time = time.time()
             audit_write({
                 "type": "telegram_enqueued",
@@ -587,6 +610,7 @@ def bubble_aggregator():
                         "poc": e.poc, "relative_volume": e.relative_volume,
                         "bubble_scale": e.bubble_scale,
                         "volume": e.volume, "block_id": e.block_id,
+                        "event_id": e.event_id, "feed_timestamp": e.feed_timestamp,
                     } for e in pending
                 ],
             })
@@ -603,16 +627,32 @@ def new_candle(period, timestamp, price, volume):
     profile_add(c, price, volume)
     return c
 
-def close_candle(tf, candle, notify=True):
-    # Pine confirms pivots BEFORE checking ta.crossover against the previous series value.
+STRUCTURE_MAPS = (order_blocks, last_pivot_high, last_pivot_low,
+                  last_pivot_high_candle, last_pivot_low_candle, trend_state)
+
+def snapshot_structure(tf):
+    return copy.deepcopy([mapping[tf] for mapping in STRUCTURE_MAPS])
+
+def restore_committed_structure(tf):
+    if tf in committed_structure:
+        values = copy.deepcopy(committed_structure[tf])
+        for mapping, value in zip(STRUCTURE_MAPS, values):
+            mapping[tf] = value
+
+def evaluate_structure(tf, candle):
     previous_high, previous_low = last_pivot_high[tf], last_pivot_low[tf]
     detect_new_pivots(tf, candle)
     invalidate_blocks(tf, candle)
     detect_structure_break(tf, candle, previous_high, previous_low)
+
+def close_candle(tf, candle, notify=True):
+    restore_committed_structure(tf)
+    evaluate_structure(tf, candle)
     history[tf].append(candle)
+    committed_structure[tf] = snapshot_structure(tf)
 
 def process_tick(price, raw_volume, timestamp_ms):
-    global last_price, last_tick_time
+    global last_price, last_tick_time, last_feed_timestamp
     try:
         price = float(price)
         raw_volume = float(raw_volume or 0)
@@ -628,6 +668,7 @@ def process_tick(price, raw_volume, timestamp_ms):
 
     with state_lock:
         last_tick_time = time.time()
+        last_feed_timestamp = timestamp
         last_price = price
         for tf, seconds in TIMEFRAMES.items():
             period = candle_period(tf, timestamp)
@@ -655,6 +696,12 @@ def process_tick(price, raw_volume, timestamp_ms):
             candle.volume += volume
             candle.tick_count += 1
             profile_add(candle, price, volume)
+        for tf, candle in current_candles.items():
+            if candle is not None and candle.complete:
+                if tf not in committed_structure:
+                    committed_structure[tf] = snapshot_structure(tf)
+                restore_committed_structure(tf)
+                evaluate_structure(tf, candle)
         # Refresh higher-TF validity before evaluating M1 on the same price update.
         for tf in ("M3", "M5"):
             event = confirmations.get(tf)
@@ -690,8 +737,11 @@ def deserialize_candle(d):
 def save_state():
     tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
     with state_lock:
+        provisional = {tf: snapshot_structure(tf) for tf in TIMEFRAMES}
+        for tf in TIMEFRAMES:
+            restore_committed_structure(tf)
         payload = {
-            "version": 1,
+            "version": 2,
             "saved_at": time.time(),
             "history": {tf: [serialize_candle(c) for c in history[tf]] for tf in TIMEFRAMES},
             "order_blocks": {
@@ -716,6 +766,9 @@ def save_state():
                 } for tf in TIMEFRAMES
             },
         }
+        for tf, values in provisional.items():
+            for mapping, value in zip(STRUCTURE_MAPS, values):
+                mapping[tf] = value
     try:
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         tmp.replace(STATE_FILE)
@@ -729,6 +782,11 @@ def load_state():
         payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         with state_lock:
             for tf in TIMEFRAMES:
+                if tf == "H4" and payload.get("version", 1) < 2:
+                    history[tf].clear()
+                    order_blocks[tf] = []
+                    history_status[tf] = "alignment_changed_requires_history"
+                    continue
                 history[tf].clear()
                 for item in payload.get("history", {}).get(tf, [])[-MAX_HISTORY:]:
                     history[tf].append(deserialize_candle(item))
@@ -738,6 +796,8 @@ def load_state():
             last_alert.clear()
             last_alert.update({k: float(v) for k, v in payload.get("last_alert", {}).items()})
             saved_structure = payload.get("structure_state", {})
+            if payload.get("version", 1) < 2:
+                saved_structure.pop("H4", None)
             for tf in TIMEFRAMES:
                 st = saved_structure.get(tf, {})
                 last_pivot_high[tf] = st.get("last_pivot_high")
@@ -747,6 +807,8 @@ def load_state():
                 low_period = st.get("last_pivot_low_period")
                 last_pivot_high_candle[tf] = next((x for x in history[tf] if x.period == high_period), None)
                 last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
+            for tf in TIMEFRAMES:
+                committed_structure[tf] = snapshot_structure(tf)
         log.info("Stato ripristinato da %s", STATE_FILE)
     except Exception as exc:
         log.warning("Impossibile ripristinare lo stato: %s", exc)
@@ -777,11 +839,22 @@ def parse_forex_candles(payload, seconds, cutoff):
 def aggregate_history(candles, source_seconds, target_seconds):
     buckets = {}
     for candle in candles:
-        buckets.setdefault(int(candle.timestamp // target_seconds), []).append(candle)
+        if target_seconds == 14400:
+            instant = datetime.fromtimestamp(candle.timestamp, timezone.utc)
+            ny = ZoneInfo("America/New_York")
+            date = instant.astimezone(ny).date()
+            anchor = datetime.combine(date, daytime(17), ny).astimezone(timezone.utc)
+            if instant < anchor:
+                anchor = datetime.combine(date - timedelta(days=1), daytime(17), ny).astimezone(timezone.utc)
+            start = int(anchor.timestamp()) + int((candle.timestamp - anchor.timestamp()) // 14400) * 14400
+            bucket = start
+        else:
+            bucket = int(candle.timestamp // target_seconds) * target_seconds
+        buckets.setdefault(bucket, []).append(candle)
     result = []
     required = target_seconds // source_seconds
-    for period, group in sorted(buckets.items()):
-        start = period * target_seconds
+    for start, group in sorted(buckets.items()):
+        period = int(start // target_seconds)
         if len(group) != required or [int(c.timestamp) for c in group] != list(range(start, start + target_seconds, source_seconds)):
             continue
         result.append(Candle(period, start, group[0].open, max(c.high for c in group),
@@ -822,6 +895,7 @@ def recover_history():
                     history_status[tf] = "insufficient_provider_history"
                     continue
                 # A complete replay supersedes partial tick-built candles.
+                committed_structure.pop(tf, None)
                 history[tf].clear()
                 order_blocks[tf] = []
                 last_pivot_high[tf] = last_pivot_low[tf] = None
