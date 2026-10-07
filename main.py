@@ -702,7 +702,10 @@ def on_message(ws, message):
                 feed_error = None
 
 def on_error(ws, error):
-    log.error("WebSocket: %s", error)
+    global feed_error
+    code = getattr(error, "status_code", None)
+    feed_error = "provider_rate_limited" if code == 429 else "websocket_error"
+    log.error("Connessione Finnhub non disponibile: %s", feed_error)
 
 def on_close(ws, status_code, message):
     global ws_connected
@@ -710,7 +713,7 @@ def on_close(ws, status_code, message):
     log.warning("Finnhub disconnesso | code=%s | %s", status_code, message)
 
 def websocket_loop():
-    delay = 2
+    delay = 60
     while not shutdown_event.is_set():
         if not resolve_symbol():
             shutdown_event.wait(60)
@@ -731,10 +734,12 @@ def websocket_loop():
         if shutdown_event.is_set():
             break
         if time.time() - started > 120:
-            delay = 2
+            delay = 60
+        if feed_error == "provider_rejected_subscription":
+            delay = 300
         log.warning("Riconnessione Finnhub tra %ss.", delay)
         shutdown_event.wait(delay)
-        delay = min(delay * 2, 60)
+        delay = min(delay * 2, 300)
 
 def health_snapshot():
     now = time.time()
