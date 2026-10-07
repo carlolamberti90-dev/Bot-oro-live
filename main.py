@@ -460,8 +460,14 @@ def detect_manipulation_bubble(tf, candle):
                 "candle_period": candle.period,
             })
 
-        if detected and alert_allowed(tf, direction, block.block_id):
-            enqueue_bubble(BubbleEvent(
+        if detected and tf == "M1" and not all(
+            name in confirmations and confirmations[name].direction == direction
+            and time.time() < (int(confirmations[name].timestamp // TIMEFRAMES[name]) + 1) * TIMEFRAMES[name]
+            for name in ("M3", "M5")):
+            continue
+
+        if detected:
+            event = BubbleEvent(
                 tf=tf,
                 direction=direction,
                 price=candle.close,
@@ -471,9 +477,13 @@ def detect_manipulation_bubble(tf, candle):
                 relative_volume=rvol,
                 bubble_scale=bubble_scale,
                 volume=candle.volume,
-                timestamp=(candle.period + 1) * TIMEFRAMES[tf],
+                timestamp=time.time(),
                 block_id=block.block_id,
-            ))
+            )
+            if tf in {"M3", "M5"}:
+                confirmations[tf] = event
+            if alert_allowed(tf, direction, block.block_id):
+                enqueue_bubble(event)
 
 def bubble_strength(scale):
     # Mirrors Pine bubble-size thresholds: >0.8 huge, >0.6 large,
@@ -494,7 +504,7 @@ def format_event(event):
     else:
         icon, raid = "🟢🫧", "Sell-side liquidity raid"
     return (
-        f"{icon} {event.tf} — {event.direction}\n"
+        f"{icon} {event.tf} — {event.direction} (in formazione)\n"
         f"Prezzo: {event.price:.3f}\n"
         f"Zona: {event.zone_low:.3f} - {event.zone_high:.3f}\n"
         f"POC: {event.poc:.3f}\n"
@@ -592,8 +602,6 @@ def close_candle(tf, candle, notify=True):
     # Pine confirms pivots BEFORE checking ta.crossover against the previous series value.
     previous_high, previous_low = last_pivot_high[tf], last_pivot_low[tf]
     detect_new_pivots(tf, candle)
-    if notify:
-        detect_manipulation_bubble(tf, candle)
     invalidate_blocks(tf, candle)
     detect_structure_break(tf, candle, previous_high, previous_low)
     history[tf].append(candle)
@@ -642,6 +650,20 @@ def process_tick(price, raw_volume, timestamp_ms):
             candle.volume += volume
             candle.tick_count += 1
             profile_add(candle, price, volume)
+        # Refresh higher-TF validity before evaluating M1 on the same price update.
+        for tf in ("M3", "M5"):
+            event = confirmations.get(tf)
+            candle = current_candles[tf]
+            if event is not None and (candle is None or not candle.complete or not any(
+                b.active and b.block_id == event.block_id and (
+                    b.bullish and candle.low < b.low and candle.close >= b.low
+                    or not b.bullish and candle.high > b.high and candle.close <= b.high)
+                for b in order_blocks[tf])):
+                confirmations.pop(tf, None)
+        for tf in [name for name in TIMEFRAMES if name != "M1"] + ["M1"]:
+            candle = current_candles[tf]
+            if candle is not None and candle.complete:
+                detect_manipulation_bubble(tf, candle)
 
 def serialize_candle(c):
     return {
