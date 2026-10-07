@@ -498,6 +498,14 @@ def build_multi_tf_message(events):
         parts += [format_event(event), ""]
     return "\n".join(parts).rstrip()
 
+def filter_m1_confirmation(events):
+    """M1 requires M3 AND M5 of the same direction in this aggregation batch."""
+    confirmations = {}
+    for event in events:
+        confirmations.setdefault(event.direction, set()).add(event.tf)
+    return [event for event in events if event.tf != "M1"
+            or {"M3", "M5"}.issubset(confirmations[event.direction])]
+
 def bubble_aggregator():
     global last_alert_time
     pending = []
@@ -513,6 +521,13 @@ def bubble_aggregator():
         except queue.Empty:
             pass
         if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
+            original_count = len(pending)
+            pending = filter_m1_confirmation(pending)
+            if len(pending) < original_count:
+                log.info("M1 scartato: manca tripla conferma M1/M3/M5 nella stessa direzione.")
+            if not pending:
+                first_time = None
+                continue
             pending.sort(key=lambda e: tf_order.get(e.tf, 999))
             message = build_multi_tf_message(pending)
             enqueue_telegram(message)
@@ -788,6 +803,8 @@ def health_snapshot():
         "closed_candles": closed,
         "ready": ready,
         "timeframes": list(TIMEFRAMES.keys()),
+        "m1_requires": ["M3", "M5"],
+        "confirmation_window_seconds": MULTI_TF_WINDOW_SECONDS,
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
     }
