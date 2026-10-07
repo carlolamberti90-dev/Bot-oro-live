@@ -5,6 +5,7 @@ import queue
 import logging
 import threading
 import collections
+import math
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -558,7 +559,7 @@ def process_tick(price, raw_volume, timestamp_ms):
         timestamp_ms = int(timestamp_ms)
     except (TypeError, ValueError):
         return
-    if price <= 0:
+    if not math.isfinite(price) or not math.isfinite(raw_volume) or price <= 0 or timestamp_ms <= 0:
         return
     volume = raw_volume if raw_volume > 0 else (1.0 if USE_TICK_VOLUME_FALLBACK else 0.0)
     if volume <= 0:
@@ -696,10 +697,19 @@ def on_message(ws, message):
         return
     for trade in payload.get("data", []):
         if trade.get("s") == SYMBOL:
+            prior_tick = last_tick_time
             process_tick(trade.get("p"), trade.get("v", 0), trade.get("t"))
             if last_tick_time is not None:
                 subscription_verified = True
                 feed_error = None
+                if prior_tick is None:
+                    log.info("Primo prezzo oro ricevuto: %s | %s", SYMBOL, last_price)
+
+def feed_monitor():
+    while not shutdown_event.wait(60):
+        snap = health_snapshot()
+        log.info("Stato feed: %s | prezzo=%s | eta_tick=%s | sottoscrizione_verificata=%s",
+                 snap["status"], snap["last_price"], snap["last_tick_age_seconds"], snap["subscription_verified"])
 
 def on_error(ws, error):
     global feed_error
@@ -826,6 +836,7 @@ def main():
     threading.Thread(target=bubble_aggregator, name="bubble-aggregator", daemon=True).start()
     threading.Thread(target=persistence_worker, name="persistence-worker", daemon=True).start()
     threading.Thread(target=health_server, name="health-server", daemon=True).start()
+    threading.Thread(target=feed_monitor, name="feed-monitor", daemon=True).start()
     try:
         websocket_loop()
     finally:
