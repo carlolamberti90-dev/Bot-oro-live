@@ -43,8 +43,13 @@ USE_TICK_VOLUME_FALLBACK = True
 
 TIMEFRAMES = {
     "M1": 60, "M3": 180, "M5": 300, "M15": 900,
-    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
+    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
 }
+
+def candle_period(tf, timestamp):
+    # Weekly buckets begin Monday 00:00 UTC, rather than Unix epoch Thursday.
+    offset = 3 * 86400 if tf == "W1" else 0
+    return int((timestamp + offset) // TIMEFRAMES[tf])
 
 @dataclass
 class Candle:
@@ -406,7 +411,7 @@ def invalidate_blocks(tf, candle):
 
 def alert_allowed(tf, direction, block_id):
     current = current_candles[tf]
-    period = current.period if current is not None else int(time.time() // TIMEFRAMES[tf])
+    period = current.period if current is not None else candle_period(tf, time.time())
     key = f"{tf}:{direction}:{period}"
     now = time.time()
     if now - last_alert.get(key, 0) < SAME_BUBBLE_COOLDOWN_SECONDS:
@@ -625,7 +630,7 @@ def process_tick(price, raw_volume, timestamp_ms):
         last_tick_time = time.time()
         last_price = price
         for tf, seconds in TIMEFRAMES.items():
-            period = int(timestamp // seconds)
+            period = candle_period(tf, timestamp)
             candle = current_candles[tf]
             if candle is None:
                 current_candles[tf] = new_candle(period, timestamp, price, volume)
@@ -763,7 +768,8 @@ def parse_forex_candles(payload, seconds, cutoff):
         if not all(math.isfinite(x) for x in values) or not (0 < values[2] <= min(values[0], values[3]) <= max(values[0], values[3]) <= values[1]) or values[4] < 0:
             raise ValueError("invalid_ohlcv")
         if stamp + seconds <= cutoff:
-            candles.append(Candle(stamp // seconds, stamp, *values))
+            period = candle_period("W1", stamp) if seconds == 604800 else stamp // seconds
+            candles.append(Candle(period, stamp, *values))
     if any(b.timestamp <= a.timestamp for a, b in zip(candles, candles[1:])):
         raise ValueError("non_chronological_candles")
     return candles
@@ -789,7 +795,7 @@ def recover_history():
         return
     cutoff = int(time.time())
     mapping = {"M1": ("1", 60), "M5": ("5", 300), "M15": ("15", 900),
-               "M30": ("30", 1800), "H1": ("60", 3600), "D1": ("D", 86400)}
+               "M30": ("30", 1800), "H1": ("60", 3600), "D1": ("D", 86400), "W1": ("W", 604800)}
     retrieved = {}
     try:
         for tf, (resolution, seconds) in mapping.items():
@@ -1008,6 +1014,7 @@ def main():
         "Avvio XAU/USD bubble detector | Pivot=%s Lookback=%s Blocks=%s Sensitivity=%s",
         PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,
     )
+    log.info("Timeframe attivi: %s", ", ".join(TIMEFRAMES))
     threading.Thread(target=telegram_worker, name="telegram-worker", daemon=True).start()
     threading.Thread(target=bubble_aggregator, name="bubble-aggregator", daemon=True).start()
     threading.Thread(target=persistence_worker, name="persistence-worker", daemon=True).start()
