@@ -415,6 +415,23 @@ def add_order_block(tf, pivot_candle, bullish):
         active.pop(0).active = False
     prune_blocks(tf)
 
+def pivot_window_has_missing_trading_bars(tf, candles):
+    """Reject missing intraday bars; allow the regular NY gold session closure."""
+    seconds = TIMEFRAMES[tf]
+    if seconds > 3600:
+        return False  # H4/D1 session boundaries need separate coverage validation.
+    ny = ZoneInfo("America/New_York")
+    for previous, current in zip(candles, candles[1:]):
+        for period in range(previous.period + 1, current.period):
+            instant = datetime.fromtimestamp(period * seconds, timezone.utc).astimezone(ny)
+            weekday = instant.weekday()
+            closed = (weekday == 5 or (weekday == 4 and instant.hour >= 17)
+                      or (weekday == 6 and instant.hour < 18)
+                      or (weekday < 4 and 17 <= instant.hour < 18))
+            if not closed:
+                return True
+    return False
+
 def detect_new_pivots(tf, current=None):
     candles = list(history[tf]) + ([current] if current is not None else [])
     required = PIVOT_LENGTH * 2 + 1
@@ -424,6 +441,9 @@ def detect_new_pivots(tf, current=None):
     if index < PIVOT_LENGTH:
         return
 
+    window = candles[index - PIVOT_LENGTH:index + PIVOT_LENGTH + 1]
+    if pivot_window_has_missing_trading_bars(tf, window):
+        return
     pivot = candles[index]
     if is_pivot_high(candles, index):
         last_pivot_high[tf] = pivot.high
@@ -784,6 +804,7 @@ def save_state():
             restore_committed_structure(tf)
         payload = {
             "version": 2,
+            "structure_algorithm": 3,
             "price_trial": None if price_trial is None else price_trial.state(),
             "saved_at": time.time(),
             "history_limits": HISTORY_LIMITS,
@@ -897,7 +918,9 @@ def load_state():
                 last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
             for tf in TIMEFRAMES:
                 committed_structure[tf] = snapshot_structure(tf)
-            if payload.get('replay_timeframes'):
+            if payload.get("structure_algorithm") != 3:
+                restore_merged_history(dict(payload, replay_timeframes=list(TIMEFRAMES), restore_replay=True))
+            elif payload.get('replay_timeframes'):
                 restore_merged_history(dict(payload, restore_replay=True))
         log.info("Storico e struttura ripristinati senza invio di segnali passati: %s candele", {tf: len(history[tf]) for tf in TIMEFRAMES})
     except Exception as exc:
