@@ -36,7 +36,7 @@ class HistoryStore:
         self.lock = threading.Lock()
         self.status = 'not_configured' if not self.url else 'not_checked'
         self.last_saved_at = None
-        self.interval = max(60, int(os.getenv('HISTORY_REMOTE_SAVE_SECONDS', '600')))
+        self.interval = 60  # Checkpoint every minute; archive never expires automatically.
         self.next_save = 0
 
     def connection(self):
@@ -47,6 +47,27 @@ class HistoryStore:
         connection.execute('SET statement_timeout = 15000')
         connection.execute('CREATE TABLE IF NOT EXISTS bubble_checkpoints '
                            '(key TEXT PRIMARY KEY, saved_at DOUBLE PRECISION NOT NULL, payload BYTEA NOT NULL)')
+
+    def archive_candles(self, connection, *payloads):
+        """Append all available closed candles before trimming the working checkpoint."""
+        connection.execute('CREATE TABLE IF NOT EXISTS bubble_candle_archive '
+                           '(symbol TEXT NOT NULL, timeframe TEXT NOT NULL, period BIGINT NOT NULL, '
+                           'payload BYTEA NOT NULL, archived_at TIMESTAMPTZ NOT NULL DEFAULT now(), '
+                           'PRIMARY KEY(symbol, timeframe, period))')
+        rows = {}
+        for payload in payloads:
+            if not payload:
+                continue
+            for tf, candles in payload.get('history', {}).items():
+                for candle in candles:
+                    key = (self.key, tf, int(candle['period']))
+                    rows[key] = gzip.compress(json.dumps(candle, separators=(',', ':')).encode())
+        if rows:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    'INSERT INTO bubble_candle_archive (symbol,timeframe,period,payload) '
+                    'VALUES (%s,%s,%s,%s) ON CONFLICT (symbol,timeframe,period) DO NOTHING',
+                    [(*key, value) for key, value in rows.items()])
 
     def save(self, payload, force=False):
         if not self.url:
@@ -61,6 +82,7 @@ class HistoryStore:
                 row = connection.execute('SELECT payload FROM bubble_checkpoints WHERE key=%s FOR UPDATE',
                                          (self.key,)).fetchone()
                 old = None if row is None else json.loads(gzip.decompress(bytes(row[0])))
+                self.archive_candles(connection, old, payload)
                 payload = merge_checkpoints(old, payload)
                 compressed = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
                 connection.execute('INSERT INTO bubble_checkpoints VALUES (%s,%s,%s) '
