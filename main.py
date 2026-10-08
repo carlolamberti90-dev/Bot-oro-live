@@ -18,6 +18,7 @@ from pathlib import Path
 
 import requests
 import websocket
+from price_trial import PriceRaidTrial, format_trial
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("xau-lux-bubble")
@@ -110,6 +111,9 @@ confirmations = {}
 history_status = {tf: "not_checked" for tf in TIMEFRAMES}
 history_retry_after = 0
 historical_reference = {}
+PRICE_RAID_TRIAL = os.getenv("PRICE_RAID_TRIAL", "true").lower() in {"1", "true", "yes", "on"}
+price_trial = None
+restored_trial_state = None
 
 current_candles = {tf: None for tf in TIMEFRAMES}
 history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
@@ -466,6 +470,8 @@ def enqueue_bubble(event):
         log.error("Coda bubble piena: evento scartato.")
 
 def detect_manipulation_bubble(tf, candle):
+    if PRICE_RAID_TRIAL and price_trial is not None:
+        return
     if not SHOW_MANIPULATION_BUBBLES:
         return
 
@@ -766,6 +772,7 @@ def save_state():
             restore_committed_structure(tf)
         payload = {
             "version": 2,
+            "price_trial": None if price_trial is None else price_trial.state(),
             "saved_at": time.time(),
             "history": {tf: [serialize_candle(c) for c in history[tf]] for tf in TIMEFRAMES},
             "order_blocks": {
@@ -800,10 +807,12 @@ def save_state():
         log.warning("Persistenza stato non disponibile: %s", exc)
 
 def load_state():
+    global restored_trial_state
     if not STATE_FILE.exists():
         return
     try:
         payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        restored_trial_state = payload.get("price_trial")
         with state_lock:
             for tf in TIMEFRAMES:
                 if tf == "H4" and payload.get("version", 1) < 2:
@@ -1034,6 +1043,13 @@ def on_message(ws, message):
             prior_tick = last_tick_time
             accepted = process_tick(trade.get("p"), trade.get("v", 0), trade.get("t"))
             if accepted:
+                if PRICE_RAID_TRIAL and price_trial is not None:
+                    with state_lock:
+                        events = price_trial.process(last_price, last_feed_timestamp)
+                    if events:
+                        enqueue_telegram(format_trial(events), [e['event_id'] for e in events])
+                        audit_write({'type': 'telegram_enqueued', 'mode': 'price_raid_trial',
+                                     'enqueued_at': time.time(), 'events': events})
                 subscription_verified = True
                 feed_error = None
                 if prior_tick is None:
@@ -1140,6 +1156,8 @@ def health_snapshot():
         "confirmation_validity": "until_next_M3_or_M5_candle_close",
         "history_status": dict(history_status),
         "historical_reference": copy.deepcopy(historical_reference),
+        "signal_mode": "price_raid_trial" if PRICE_RAID_TRIAL else "luxalgo_reconstruction",
+        "trial_active_zones": 0 if price_trial is None else sum(z['active'] for z in price_trial.zones.values()),
         "parity_scope": "intrabar_structure_and_bubbles; upstream volume and session alignment require comparison",
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
@@ -1179,9 +1197,16 @@ def health_server():
     server.serve_forever()
 
 def main():
+    global price_trial
     validate_config()
     load_state()
     load_historical_reference()
+    if PRICE_RAID_TRIAL:
+        trial_references = {tf: reference for tf, reference in historical_reference.items()
+                            if tf in {"M15", "M30", "H1", "H4"}}
+        price_trial = PriceRaidTrial(trial_references, candle_period, restored_trial_state)
+        log.info("PROVA prezzo: %s zone OANDA di riferimento; superamento/rientro live, senza filtro volume; validita storica non verificata",
+                 len(price_trial.zones))
     log.info(
         "Avvio XAU/USD bubble detector | Pivot=%s Lookback=%s Blocks=%s Sensitivity=%s",
         PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,

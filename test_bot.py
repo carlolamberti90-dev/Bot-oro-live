@@ -54,6 +54,20 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(records[0]['event_id'], event.event_id)
         self.assertEqual(records[0]['feed_timestamp'], 1234.5)
 
+    def test_price_trial_reaches_telegram_queue_without_duplicate_detector_alert(self):
+        main.PRICE_RAID_TRIAL = True
+        main.price_trial = main.PriceRaidTrial({'M15': {'zones': [dict(
+            block_id='trial-zone', low=99, high=102, bullish=False)]}}, main.candle_period)
+        for timestamp, price in [(1000,101),(2000,103),(3000,101),(4000,101)]:
+            main.on_message(Mock(), json.dumps({'type':'trade','data':[
+                {'s':main.SYMBOL,'p':price,'v':0,'t':timestamp}]}))
+        job = main.telegram_queue.get_nowait()
+        self.assertIn('PROVA',job['text'])
+        self.assertIn('SHORT',job['text'])
+        self.assertTrue(job['event_ids'])
+        self.assertTrue(main.telegram_queue.empty())
+        self.assertTrue(main.bubble_queue.empty())
+
     def candle(self, tf='M15', period=1, low=98, high=103, close=100):
         candle = main.Candle(period, period * main.TIMEFRAMES[tf], 100, high, low, close, 10)
         main.current_candles[tf] = candle
