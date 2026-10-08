@@ -45,6 +45,7 @@ SHOW_MANIPULATION_BUBBLES = True
 MAX_VOLUME_LOOKBACK = 200
 MULTI_TF_WINDOW_SECONDS = 0.05
 SAME_BUBBLE_COOLDOWN_SECONDS = 300
+OPERATIONAL_TIMEFRAMES = {"M1", "M3", "M5"}
 MAX_HISTORY = 300
 USE_TICK_VOLUME_FALLBACK = True
 
@@ -476,8 +477,9 @@ def enqueue_bubble(event):
 
 def detect_manipulation_bubble(tf, candle):
     shadow_only = PRICE_RAID_TRIAL and price_trial is not None
+    operational_events = []
     if not SHOW_MANIPULATION_BUBBLES:
-        return
+        return operational_events
 
     rvol = relative_volume(tf, candle.volume)
     max_vol = max_volume_lookback(tf, candle.volume)
@@ -519,14 +521,6 @@ def detect_manipulation_bubble(tf, candle):
         if shadow_only:
             continue
 
-        # Only M1 needs the user's triple-entry confirmation. Higher timeframes
-        # notify on their own first intrabar appearance, without bar-close waits.
-        if detected and tf == "M1" and not all(
-            name in confirmations and confirmations[name].direction == direction
-            and time.time() < (int(confirmations[name].timestamp // TIMEFRAMES[name]) + 1) * TIMEFRAMES[name]
-            for name in ("M3", "M5")):
-            continue
-
         if detected:
             event = BubbleEvent(
                 tf=tf,
@@ -543,10 +537,11 @@ def detect_manipulation_bubble(tf, candle):
                 event_id=event_id,
                 feed_timestamp=last_feed_timestamp or candle.timestamp,
             )
-            if tf in {"M3", "M5"}:
-                confirmations[tf] = event
-            if alert_allowed(tf, direction, block.block_id):
+            if tf in OPERATIONAL_TIMEFRAMES:
+                operational_events.append(event)
+            elif alert_allowed(tf, direction, block.block_id):
                 enqueue_bubble(event)
+    return operational_events
 
 def bubble_strength(scale):
     # Mirrors Pine bubble-size thresholds: >0.8 huge, >0.6 large,
@@ -594,8 +589,13 @@ def build_multi_tf_message(events):
     return "\n".join(parts).rstrip()
 
 def filter_m1_confirmation(events, now=None, refresh_confirmations=True):
-    """Compatibility helper: first appearances never wait for confirmation."""
-    return list(events)
+    """Require two distinct operational timeframes on this price update."""
+    events = list(events)
+    counts = {direction: {e.tf for e in events if e.tf in OPERATIONAL_TIMEFRAMES
+                         and e.direction == direction}
+              for direction in ("LONG", "SHORT")}
+    return [e for e in events if e.tf not in OPERATIONAL_TIMEFRAMES
+            or len(counts.get(e.direction, set())) >= 2]
 
 def bubble_aggregator():
     global last_alert_time
@@ -735,10 +735,14 @@ def process_tick(price, raw_volume, timestamp_ms):
                     or not b.bullish and candle.high > b.high and candle.close <= b.high)
                 for b in order_blocks[tf])):
                 confirmations.pop(tf, None)
+        operational_events = []
         for tf in [name for name in TIMEFRAMES if name != "M1"] + ["M1"]:
             candle = current_candles[tf]
             if candle is not None and candle.complete:
-                detect_manipulation_bubble(tf, candle)
+                operational_events.extend(detect_manipulation_bubble(tf, candle))
+        for event in filter_m1_confirmation(operational_events):
+            if alert_allowed(event.tf, event.direction, event.block_id):
+                enqueue_bubble(event)
     return True
 
 def serialize_candle(c):
@@ -1244,11 +1248,13 @@ def health_snapshot():
         "warmup_closed_candles_required": required,
         "history_recovery_complete": all(value == "recovered_provider_ohlcv" for value in history_status.values()),
         "timeframes": list(TIMEFRAMES.keys()),
-        "m1_requires": ["M3", "M5"],
+        "m1_requires": "M3 or M5",
+        "operational_confluence": {"timeframes": ["M1", "M3", "M5"], "minimum": 2,
+                                  "direction": "same_direction", "simultaneity": "same_price_update"},
         "m1_confirmation_direction": "same_direction",
         "alert_trigger": "first_intrabar_appearance",
         "wait_for_candle_close": False,
-        "confirmation_required": {tf: tf == "M1" for tf in TIMEFRAMES},
+        "confirmation_required": {tf: tf in OPERATIONAL_TIMEFRAMES for tf in TIMEFRAMES},
         "history_status": dict(history_status),
         "history_storage": {"backend": "postgres" if history_store.url else "local_ephemeral",
                             "status": history_store.status, "last_saved_at": history_store.last_saved_at,
