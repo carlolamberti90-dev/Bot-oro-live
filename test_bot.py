@@ -22,6 +22,24 @@ class DetectorTests(unittest.TestCase):
         main.order_blocks[tf] = [block]
         return block
 
+    def test_saved_oanda_history_replays_without_changing_live_state(self):
+        self.block()
+        candle = self.candle()
+        main.close_candle('M15', candle)
+        before = main.snapshot_structure('M15')
+        live_history = main.history['M15']
+        main.load_historical_reference()
+        self.assertEqual(main.historical_reference['H4']['closed_candles'], 219)
+        self.assertEqual(main.historical_reference['M15']['closed_candles'], 136)
+        self.assertEqual(main.historical_reference['M3']['closed_candles'], 40)
+        self.assertEqual(main.historical_reference['M5']['closed_candles'], 24)
+        self.assertFalse(main.historical_reference['H4']['usable_for_live_alerts'])
+        self.assertNotIn('D1', main.historical_reference)
+        self.assertEqual(main.snapshot_structure('M15'), before)
+        self.assertIs(main.history['M15'], live_history)
+        self.assertTrue(main.bubble_queue.empty())
+        self.assertTrue(main.telegram_queue.empty())
+
     def candle(self, tf='M15', period=1, low=98, high=103, close=100):
         candle = main.Candle(period, period * main.TIMEFRAMES[tf], 100, high, low, close, 10)
         main.current_candles[tf] = candle

@@ -109,6 +109,7 @@ committed_structure = {}
 confirmations = {}
 history_status = {tf: "not_checked" for tf in TIMEFRAMES}
 history_retry_after = 0
+historical_reference = {}
 
 current_candles = {tf: None for tf in TIMEFRAMES}
 history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
@@ -825,6 +826,70 @@ def persistence_worker():
     while not shutdown_event.wait(PERSIST_EVERY_SECONDS):
         save_state()
 
+def load_historical_reference():
+    """Replay the saved OANDA sample in isolation, never mixing volume feeds.
+
+    These zones are research references, not live confirmations: the sample
+    ends on October 7 and cannot establish continuity to the current feed.
+    """
+    path = Path(__file__).resolve().parent / "data" / "oanda_2026_10_07.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("source") != "TradingView OANDA:XAUUSD":
+            raise ValueError("unexpected_source")
+        samples = {}
+        for tf, rows in payload["candles"].items():
+            seconds = TIMEFRAMES[tf]
+            parsed = []
+            for row in rows:
+                stamp = float(row["timestamp"])
+                values = [float(row[k]) for k in ("open", "high", "low", "close", "volume")]
+                if not all(math.isfinite(v) for v in [stamp] + values) or not (
+                    0 < values[2] <= min(values[0], values[3]) <= max(values[0], values[3]) <= values[1]
+                ) or values[4] < 0 or stamp + seconds > time.time():
+                    raise ValueError("invalid_reference_candle")
+                parsed.append(Candle(candle_period(tf, stamp), stamp, *values))
+            if not parsed or any(b.timestamp <= a.timestamp for a, b in zip(parsed, parsed[1:])):
+                raise ValueError("invalid_reference_order")
+            samples[tf] = parsed
+        samples["M3"] = aggregate_history(samples["M1"], 60, 180)
+        samples["M5"] = aggregate_history(samples["M1"], 60, 300)
+        result = {}
+        with state_lock:
+            for tf, candles in samples.items():
+                old_history = history[tf]
+                old_structure = snapshot_structure(tf)
+                old_committed = committed_structure.pop(tf, None)
+                try:
+                    history[tf] = collections.deque(maxlen=MAX_HISTORY)
+                    order_blocks[tf] = []
+                    last_pivot_high[tf] = last_pivot_low[tf] = None
+                    last_pivot_high_candle[tf] = last_pivot_low_candle[tf] = None
+                    trend_state[tf] = 0
+                    for candle in candles:
+                        close_candle(tf, candle, notify=False)
+                    result[tf] = {
+                        "closed_candles": len(candles),
+                        "first_timestamp": candles[0].timestamp,
+                        "last_timestamp": candles[-1].timestamp,
+                        "zones": [vars(b).copy() for b in order_blocks[tf] if b.active],
+                        "usable_for_live_alerts": False,
+                        "reason": "continuity_and_volume_compatibility_unverified",
+                    }
+                finally:
+                    history[tf] = old_history
+                    for mapping, value in zip(STRUCTURE_MAPS, old_structure):
+                        mapping[tf] = value
+                    committed_structure.pop(tf, None)
+                    if old_committed is not None:
+                        committed_structure[tf] = old_committed
+        historical_reference.clear()
+        historical_reference.update(result)
+        log.info("Storico OANDA 7 ottobre caricato come riferimento separato: %s; continuita live e volumi da verificare",
+                 {tf: item["closed_candles"] for tf, item in result.items()})
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log.error("Caricamento riferimento storico OANDA fallito: %s", exc)
+
 def parse_forex_candles(payload, seconds, cutoff):
     if not isinstance(payload, dict) or payload.get("s") != "ok":
         raise ValueError("no_candles")
@@ -1059,6 +1124,7 @@ def health_snapshot():
         "m1_requires": ["M3", "M5"],
         "confirmation_validity": "until_next_M3_or_M5_candle_close",
         "history_status": dict(history_status),
+        "historical_reference": copy.deepcopy(historical_reference),
         "parity_scope": "intrabar_structure_and_bubbles; upstream volume and session alignment require comparison",
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
@@ -1100,6 +1166,7 @@ def health_server():
 def main():
     validate_config()
     load_state()
+    load_historical_reference()
     log.info(
         "Avvio XAU/USD bubble detector | Pivot=%s Lookback=%s Blocks=%s Sensitivity=%s",
         PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,
