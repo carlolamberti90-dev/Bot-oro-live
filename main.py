@@ -45,7 +45,8 @@ SHOW_MANIPULATION_BUBBLES = True
 MAX_VOLUME_LOOKBACK = 200
 MULTI_TF_WINDOW_SECONDS = 0.05
 SAME_BUBBLE_COOLDOWN_SECONDS = 300
-OPERATIONAL_TIMEFRAMES = {"M1", "M3", "M5"}
+ALERT_TIMEFRAMES = {"M3", "M5", "M15", "M30", "H1", "H4", "D1"}
+OPERATIONAL_TIMEFRAMES = set()
 MAX_HISTORY = 300
 USE_TICK_VOLUME_FALLBACK = True
 
@@ -467,6 +468,8 @@ def alert_allowed(tf, direction, block_id):
     return True
 
 def enqueue_bubble(event):
+    if event.tf not in ALERT_TIMEFRAMES:
+        return
     if event.tf in {"M3", "M5"}:
         with state_lock:
             confirmations[event.tf] = event
@@ -478,7 +481,7 @@ def enqueue_bubble(event):
 def detect_manipulation_bubble(tf, candle):
     shadow_only = PRICE_RAID_TRIAL and price_trial is not None
     operational_events = []
-    if not SHOW_MANIPULATION_BUBBLES:
+    if tf not in ALERT_TIMEFRAMES or not SHOW_MANIPULATION_BUBBLES:
         return operational_events
 
     rvol = relative_volume(tf, candle.volume)
@@ -589,13 +592,8 @@ def build_multi_tf_message(events):
     return "\n".join(parts).rstrip()
 
 def filter_m1_confirmation(events, now=None, refresh_confirmations=True):
-    """Require two distinct operational timeframes on this price update."""
-    events = list(events)
-    counts = {direction: {e.tf for e in events if e.tf in OPERATIONAL_TIMEFRAMES
-                         and e.direction == direction}
-              for direction in ("LONG", "SHORT")}
-    return [e for e in events if e.tf not in OPERATIONAL_TIMEFRAMES
-            or len(counts.get(e.direction, set())) >= 2]
+    """Independent first-appearance alerts on the requested timeframes; M1 disabled."""
+    return [event for event in events if event.tf in ALERT_TIMEFRAMES]
 
 def bubble_aggregator():
     global last_alert_time
@@ -613,6 +611,10 @@ def bubble_aggregator():
             pass
         if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
             # A later disappearance must not erase an observed first appearance.
+            pending = filter_m1_confirmation(pending)
+            if not pending:
+                first_time = None
+                continue
             pending.sort(key=lambda e: tf_order.get(e.tf, 999))
             message = build_multi_tf_message(pending)
             enqueue_telegram(message, [event.event_id for event in pending])
@@ -1248,13 +1250,12 @@ def health_snapshot():
         "warmup_closed_candles_required": required,
         "history_recovery_complete": all(value == "recovered_provider_ohlcv" for value in history_status.values()),
         "timeframes": list(TIMEFRAMES.keys()),
-        "m1_requires": "M3 or M5",
-        "operational_confluence": {"timeframes": ["M1", "M3", "M5"], "minimum": 2,
-                                  "direction": "same_direction", "simultaneity": "same_price_update"},
-        "m1_confirmation_direction": "same_direction",
+        "alert_timeframes": [tf for tf in TIMEFRAMES if tf in ALERT_TIMEFRAMES],
+        "m1_enabled": False,
+        "operational_confluence": None,
         "alert_trigger": "first_intrabar_appearance",
         "wait_for_candle_close": False,
-        "confirmation_required": {tf: tf in OPERATIONAL_TIMEFRAMES for tf in TIMEFRAMES},
+        "confirmation_required": {tf: False for tf in ALERT_TIMEFRAMES},
         "history_status": dict(history_status),
         "history_storage": {"backend": "postgres" if history_store.url else "local_ephemeral",
                             "status": history_store.status, "last_saved_at": history_store.last_saved_at,
@@ -1330,6 +1331,7 @@ def main():
         PIVOT_LENGTH, VOLUME_LOOKBACK, MAX_RECENT_BLOCKS, BUBBLE_SENSITIVITY,
     )
     log.info("Timeframe attivi: %s", ", ".join(TIMEFRAMES))
+    log.info("Policy alert: M1 disabilitato | timeframe=%s | prima comparsa intrabar | nessuna conferma multi-timeframe", ", ".join(tf for tf in TIMEFRAMES if tf in ALERT_TIMEFRAMES))
     threading.Thread(target=telegram_worker, name="telegram-worker", daemon=True).start()
     threading.Thread(target=bubble_aggregator, name="bubble-aggregator", daemon=True).start()
     threading.Thread(target=persistence_worker, name="persistence-worker", daemon=True).start()
