@@ -174,6 +174,7 @@ AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").strip().lower() in {"1", "tru
 AUDIT_FILE = Path(os.getenv("AUDIT_FILE", "bubble_audit.jsonl"))
 AUDIT_MAX_BYTES = int(os.getenv("AUDIT_MAX_BYTES", str(5 * 1024 * 1024)))
 audit_lock = threading.Lock()
+audit_candidate_ids = collections.OrderedDict()
 
 def audit_write(record):
     if not AUDIT_ENABLED:
@@ -181,6 +182,15 @@ def audit_write(record):
     try:
         line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
         with audit_lock:
+            if record.get("type") == "candidate":
+                identity = record.get("event_id")
+                if identity in audit_candidate_ids:
+                    return
+                audit_candidate_ids[identity] = True
+                while len(audit_candidate_ids) > 2000:
+                    audit_candidate_ids.popitem(last=False)
+            if record.get("type") in {"candidate", "telegram_enqueued", "telegram_sent"}:
+                log.info("Confronto bubble: %s", line.strip())
             if AUDIT_FILE.exists() and AUDIT_FILE.stat().st_size >= AUDIT_MAX_BYTES:
                 rotated = AUDIT_FILE.with_suffix(AUDIT_FILE.suffix + ".1")
                 try:
@@ -243,6 +253,7 @@ def telegram_worker():
                     retryable = r.status_code == 429 or r.status_code >= 500
                     audit_write({
                         "type": "telegram_error",
+                        "event_ids": event_ids,
                         "error_at": time.time(),
                         "telegram_status": r.status_code,
                         "response": r.text[:300],
@@ -253,6 +264,7 @@ def telegram_worker():
                 except requests.RequestException as exc:
                     audit_write({
                         "type": "telegram_network_error",
+                        "event_ids": event_ids,
                         "error_at": time.time(),
                         "error": str(exc),
                     })
@@ -471,8 +483,11 @@ def detect_manipulation_bubble(tf, candle):
             direction = "SHORT"
 
         if detected:
+            event_id = hashlib.sha256(f"{tf}:{direction}:{candle.period}:{block.block_id}".encode()).hexdigest()[:20]
             audit_write({
                 "type": "candidate",
+                "event_id": event_id,
+                "feed_timestamp": last_feed_timestamp or candle.timestamp,
                 "detected_at": time.time(),
                 "tf": tf,
                 "direction": direction,
@@ -506,7 +521,7 @@ def detect_manipulation_bubble(tf, candle):
                 volume=candle.volume,
                 timestamp=time.time(),
                 block_id=block.block_id,
-                event_id=hashlib.sha256(f"{tf}:{direction}:{candle.period}:{block.block_id}".encode()).hexdigest()[:20],
+                event_id=event_id,
                 feed_timestamp=last_feed_timestamp or candle.timestamp,
             )
             if tf in {"M3", "M5"}:

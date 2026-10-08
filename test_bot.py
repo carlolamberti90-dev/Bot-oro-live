@@ -40,6 +40,20 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(main.bubble_queue.empty())
         self.assertTrue(main.telegram_queue.empty())
 
+    def test_comparison_audit_keeps_first_detection_and_links_event(self):
+        main.AUDIT_ENABLED = True
+        main.AUDIT_FILE = Path(self.temp.name) / 'audit.jsonl'
+        self.block()
+        candle = self.candle()
+        main.last_feed_timestamp = 1234.5
+        main.detect_manipulation_bubble('M15', candle)
+        main.detect_manipulation_bubble('M15', candle)
+        records = [json.loads(line) for line in main.AUDIT_FILE.read_text().splitlines()]
+        self.assertEqual(len(records), 1)
+        event = main.bubble_queue.get_nowait()
+        self.assertEqual(records[0]['event_id'], event.event_id)
+        self.assertEqual(records[0]['feed_timestamp'], 1234.5)
+
     def candle(self, tf='M15', period=1, low=98, high=103, close=100):
         candle = main.Candle(period, period * main.TIMEFRAMES[tf], 100, high, low, close, 10)
         main.current_candles[tf] = candle
