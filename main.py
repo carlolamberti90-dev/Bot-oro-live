@@ -768,6 +768,7 @@ def save_state():
             "version": 2,
             "price_trial": None if price_trial is None else price_trial.state(),
             "saved_at": time.time(),
+            "history_limits": HISTORY_LIMITS,
             "history": {tf: [serialize_candle(c) for c in history[tf]] for tf in TIMEFRAMES},
             "order_blocks": {
                 tf: [
@@ -800,7 +801,39 @@ def save_state():
         tmp.replace(STATE_FILE)
     except Exception as exc:
         log.warning("Persistenza stato non disponibile: %s", exc)
-    history_store.save(payload, force=shutdown_event.is_set())
+    merged = history_store.save(payload, force=shutdown_event.is_set())
+    if isinstance(merged, dict):
+        restore_merged_history(merged)
+
+def restore_merged_history(payload):
+    with state_lock:
+        for tf in payload.get('replay_timeframes', []):
+            if tf not in TIMEFRAMES:
+                continue
+            combined = {c.period: c for c in history[tf]}
+            added = False
+            for item in payload.get('history', {}).get(tf, []):
+                if int(item['period']) not in combined:
+                    c = deserialize_candle(item)
+                    combined[c.period] = c
+                    added = True
+            if not added and history[tf]:
+                # During startup the merged candles are already present, but the
+                # stored structure was built by an instance missing some of them.
+                added = payload.get('restore_replay', False)
+            if not added:
+                continue
+            candles = [combined[p] for p in sorted(combined)[-HISTORY_LIMITS[tf]:]]
+            history[tf].clear()
+            committed_structure.pop(tf, None)
+            order_blocks[tf] = []
+            last_pivot_high[tf] = last_pivot_low[tf] = None
+            last_pivot_high_candle[tf] = last_pivot_low_candle[tf] = None
+            trend_state[tf] = 0
+            for candle in candles:
+                close_candle(tf, candle, notify=False)
+            confirmations.pop(tf, None)
+            log.info('Storico unito e rianalizzato senza alert passati: %s | %s candele', tf, len(candles))
 
 def load_state():
     global restored_trial_state
@@ -846,6 +879,8 @@ def load_state():
                 last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
             for tf in TIMEFRAMES:
                 committed_structure[tf] = snapshot_structure(tf)
+            if payload.get('replay_timeframes'):
+                restore_merged_history(dict(payload, restore_replay=True))
         log.info("Storico e struttura ripristinati senza invio di segnali passati: %s candele", {tf: len(history[tf]) for tf in TIMEFRAMES})
     except Exception as exc:
         log.warning("Impossibile ripristinare lo stato: %s", exc)

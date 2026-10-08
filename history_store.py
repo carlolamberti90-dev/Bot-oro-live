@@ -8,6 +8,27 @@ import time
 
 log = logging.getLogger(__name__)
 
+def merge_checkpoints(old, new):
+    """A replacement instance must never erase candles collected by its predecessor."""
+    if not old:
+        return new
+    result = dict(new)
+    result['history'] = {}
+    replay = []
+    for tf, incoming in new.get('history', {}).items():
+        incoming_periods = {c['period'] for c in incoming}
+        candles = {c['period']: c for c in old.get('history', {}).get(tf, [])}
+        candles.update({c['period']: c for c in incoming})
+        limit = new.get('history_limits', {}).get(tf, 10080)
+        retained = [candles[p] for p in sorted(candles)[-limit:]]
+        result['history'][tf] = retained
+        if any(c['period'] not in incoming_periods for c in retained):
+            replay.append(tf)
+    result['replay_timeframes'] = replay
+    result['last_alert'] = dict(old.get('last_alert', {}))
+    result['last_alert'].update(new.get('last_alert', {}))
+    return result
+
 class HistoryStore:
     def __init__(self, key):
         self.key = key
@@ -36,6 +57,12 @@ class HistoryStore:
             compressed = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
             with self.lock, self.connection() as connection:
                 self.prepare(connection)
+                connection.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (self.key,))
+                row = connection.execute('SELECT payload FROM bubble_checkpoints WHERE key=%s FOR UPDATE',
+                                         (self.key,)).fetchone()
+                old = None if row is None else json.loads(gzip.decompress(bytes(row[0])))
+                payload = merge_checkpoints(old, payload)
+                compressed = gzip.compress(json.dumps(payload, separators=(',', ':')).encode())
                 connection.execute('INSERT INTO bubble_checkpoints VALUES (%s,%s,%s) '
                     'ON CONFLICT (key) DO UPDATE SET saved_at=EXCLUDED.saved_at,payload=EXCLUDED.payload '
                     'WHERE bubble_checkpoints.saved_at < EXCLUDED.saved_at',
@@ -43,6 +70,7 @@ class HistoryStore:
             self.status = 'saved'
             self.last_saved_at = payload['saved_at']
             self.next_save = time.monotonic() + self.interval
+            return payload
         except Exception:
             self.status = 'save_failed'
             log.error('Archivio storico esterno: salvataggio fallito; cache locale conservata')

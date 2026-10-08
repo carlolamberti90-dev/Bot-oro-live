@@ -6,9 +6,24 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 import main
-from history_store import HistoryStore
+from history_store import HistoryStore, merge_checkpoints
 
 class HistoryTests(unittest.TestCase):
+    def test_replacement_instance_preserves_older_candles_and_alert_ids(self):
+        old = {'history': {'M1': [{'period': 1}, {'period': 2}]}, 'last_alert': {'old': 1}}
+        new = {'history': {'M1': [{'period': 3}]}, 'history_limits': {'M1': 3}, 'last_alert': {'new': 2}}
+        result = merge_checkpoints(old, new)
+        self.assertEqual([c['period'] for c in result['history']['M1']], [1, 2, 3])
+        self.assertEqual(result['replay_timeframes'], ['M1'])
+        self.assertEqual(result['last_alert'], {'old': 1, 'new': 2})
+
+    def test_retention_merge_prefers_new_candle_and_drops_only_oldest(self):
+        old = {'history': {'M1': [{'period': 1}, {'period': 2, 'close': 100}]}}
+        new = {'history': {'M1': [{'period': 2, 'close': 101}, {'period': 3}]}, 'history_limits': {'M1': 2}}
+        result = merge_checkpoints(old, new)
+        self.assertEqual(result['history']['M1'], new['history']['M1'])
+        self.assertEqual(result['replay_timeframes'], [])
+
     def setUp(self):
         importlib.reload(main)
         self.temp = tempfile.TemporaryDirectory()
