@@ -246,22 +246,38 @@ def telegram_worker():
             continue
         try:
             for attempt in range(4):
+                retry_delay = 2 ** attempt
                 try:
                     r = session.post(
                         telegram_url(),
                         json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
                         timeout=(5, 10),
                     )
-                    if r.ok:
+                    try:
+                        api_result = r.json()
+                    except ValueError:
+                        api_result = {}
+                    if not isinstance(api_result, dict):
+                        api_result = {}
+                    result = api_result.get("result")
+                    message_id = result.get("message_id") if isinstance(result, dict) else None
+                    if r.ok and api_result.get("ok") is True and type(message_id) is int:
                         audit_write({
                             "type": "telegram_sent",
                             "event_ids": event_ids,
                             "sent_at": time.time(),
                             "telegram_status": r.status_code,
+                            "telegram_message_id": message_id,
+                            "telegram_api_ok": True,
                         })
                         log.info("Bubble inviata su Telegram.")
                         break
-                    retryable = r.status_code == 429 or r.status_code >= 500
+                    api_code = api_result.get("error_code", r.status_code)
+                    retryable = api_code == 429 or r.status_code >= 500 or (r.ok and not message_id)
+                    parameters = api_result.get("parameters") or {}
+                    retry_delay = parameters.get("retry_after", 2 ** attempt) if isinstance(parameters, dict) else 2 ** attempt
+                    if not isinstance(retry_delay, (int, float)) or retry_delay < 0:
+                        retry_delay = 2 ** attempt
                     audit_write({
                         "type": "telegram_error",
                         "event_ids": event_ids,
@@ -281,7 +297,8 @@ def telegram_worker():
                     })
                     log.error("Errore rete Telegram: %s", exc)
                 if attempt < 3:
-                    time.sleep(2 ** attempt)
+                    if shutdown_event.wait(retry_delay):
+                        break
         except Exception:
             log.exception("Errore inatteso Telegram.")
         finally:
