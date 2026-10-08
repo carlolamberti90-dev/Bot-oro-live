@@ -138,6 +138,7 @@ last_alert = {}
 ws_connected = False
 feed_error = None
 subscription_verified = False
+active_socket = None
 
 def resolve_symbol():
     """Validate against the provider's catalog; never substitute another broker."""
@@ -1077,8 +1078,9 @@ def on_error(ws, error):
     log.error("Connessione Finnhub non disponibile: %s", feed_error)
 
 def on_close(ws, status_code, message):
-    global ws_connected
+    global ws_connected, subscription_verified
     ws_connected = False
+    subscription_verified = False
     with state_lock:
         confirmations.clear()
         for candle in current_candles.values():
@@ -1086,7 +1088,52 @@ def on_close(ws, status_code, message):
                 candle.complete = False
     log.warning("Finnhub disconnesso | code=%s | %s", status_code, message)
 
+def check_feed_connection(now=None):
+    """An open socket is not proof of incoming, current market data."""
+    now = time.time() if now is None else now
+    ws = active_socket
+    if ws is None or not ws_connected:
+        return
+    origin = max(last_connection_time or 0, last_tick_time or 0)
+    transport_stale = origin and now - origin > STALE_AFTER_SECONDS
+    source_stale = last_feed_timestamp is not None and now - last_feed_timestamp > STALE_AFTER_SECONDS
+    retry_history = history_retry_after > 0 and now >= history_retry_after and not all(
+        value == "recovered_provider_ohlcv" for value in history_status.values())
+    if transport_stale or source_stale:
+        log.warning("Riavvio feed: price_stream_stale")
+        ws.close()
+    elif retry_history and probe_history_access(now):
+        # Never interrupt healthy H4/D1 candles just to repeat a denied request.
+        log.info("Storico nuovamente accessibile; riconnessione per recupero completo.")
+        ws.close()
+
+def probe_history_access(now):
+    global history_retry_after
+    history_retry_after = now + 3600
+    try:
+        response = requests.get("https://finnhub.io/api/v1/forex/candle",
+            params={"symbol": SYMBOL, "resolution": "1", "from": int(now) - 86400, "to": int(now)},
+            headers={"X-Finnhub-Token": FINNHUB_TOKEN}, timeout=(5, 10))
+        if response.status_code in {401, 403}:
+            log.warning("Storico ancora non accessibile: HTTP %s; feed live mantenuto.", response.status_code)
+            return False
+        if response.status_code == 200 and len(parse_forex_candles(response.json(), 60, now)) >= 200:
+            history_retry_after = 0
+            return True
+        history_retry_after = now + 300
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        history_retry_after = now + 300
+    return False
+
+def connection_watchdog():
+    while not shutdown_event.wait(30):
+        try:
+            check_feed_connection()
+        except Exception:
+            log.exception("Controllo connessione fallito.")
+
 def websocket_loop():
+    global active_socket
     delay = 60
     while not shutdown_event.is_set():
         if not resolve_symbol():
@@ -1100,12 +1147,15 @@ def websocket_loop():
                 on_open=on_open, on_message=on_message,
                 on_error=on_error, on_close=on_close,
             )
+            active_socket = ws
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except KeyboardInterrupt:
             shutdown_event.set()
             break
         except Exception:
             log.exception("Errore WebSocket.")
+        finally:
+            active_socket = None
         if shutdown_event.is_set():
             break
         if time.time() - started > 120:
@@ -1120,6 +1170,7 @@ def health_snapshot():
     now = time.time()
     with state_lock:
         tick_age = None if last_tick_time is None else round(now - last_tick_time, 1)
+        source_age = None if last_feed_timestamp is None else round(now - last_feed_timestamp, 1)
         active = {tf: sum(1 for b in order_blocks[tf] if b.active) for tf in TIMEFRAMES}
         closed = {tf: len(history[tf]) for tf in TIMEFRAMES}
         required = max(MAX_VOLUME_LOOKBACK - 1, VOLUME_LOOKBACK, ATR_LENGTH + 1, PIVOT_LENGTH * 2 + 1)
@@ -1128,7 +1179,7 @@ def health_snapshot():
         status = "feed_error"
     elif last_tick_time is None:
         status = "starting"
-    elif tick_age is not None and tick_age > STALE_AFTER_SECONDS:
+    elif (tick_age is not None and tick_age > STALE_AFTER_SECONDS) or (source_age is not None and source_age > STALE_AFTER_SECONDS):
         status = "feed_stale"
     elif not ws_connected:
         status = "disconnected"
@@ -1143,6 +1194,9 @@ def health_snapshot():
         "feed_error": feed_error,
         "last_price": last_price,
         "last_tick_age_seconds": tick_age,
+        "last_source_price_age_seconds": source_age,
+        "automatic_feed_watchdog": True,
+        "next_history_retry_at": history_retry_after or None,
         "last_alert_age_seconds": None if last_alert_time is None else round(now - last_alert_time, 1),
         "pivot_length": PIVOT_LENGTH,
         "volume_lookback": VOLUME_LOOKBACK,
@@ -1228,6 +1282,7 @@ def main():
     threading.Thread(target=persistence_worker, name="persistence-worker", daemon=True).start()
     threading.Thread(target=health_server, name="health-server", daemon=True).start()
     threading.Thread(target=feed_monitor, name="feed-monitor", daemon=True).start()
+    threading.Thread(target=connection_watchdog, name="connection-watchdog", daemon=True).start()
     try:
         websocket_loop()
     finally:
