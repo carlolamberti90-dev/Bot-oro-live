@@ -675,11 +675,14 @@ def restore_committed_structure(tf):
         for mapping, value in zip(STRUCTURE_MAPS, values):
             mapping[tf] = value
 
-def evaluate_structure(tf, candle):
+def evaluate_structure(tf, candle, detect_bubbles=False):
     previous_high, previous_low = last_pivot_high[tf], last_pivot_low[tf]
     detect_new_pivots(tf, candle)
     invalidate_blocks(tf, candle)
+    # Pine checks manipulation on existing blocks BEFORE creating breakout blocks.
+    events = detect_manipulation_bubble(tf, candle) if detect_bubbles else []
     detect_structure_break(tf, candle, previous_high, previous_low)
+    return events
 
 def close_candle(tf, candle, notify=True):
     restore_committed_structure(tf)
@@ -738,27 +741,13 @@ def process_tick(price, raw_volume, timestamp_ms):
             candle.volume += volume
             candle.tick_count += 1
             profile_add(candle, price, volume)
+        operational_events = []
         for tf, candle in current_candles.items():
             if candle is not None and candle.complete:
                 if tf not in committed_structure:
                     committed_structure[tf] = snapshot_structure(tf)
                 restore_committed_structure(tf)
-                evaluate_structure(tf, candle)
-        # Refresh higher-TF validity before evaluating M1 on the same price update.
-        for tf in ("M3", "M5"):
-            event = confirmations.get(tf)
-            candle = current_candles[tf]
-            if event is not None and (candle is None or not candle.complete or not any(
-                b.active and b.block_id == event.block_id and (
-                    b.bullish and candle.low < b.low and candle.close >= b.low
-                    or not b.bullish and candle.high > b.high and candle.close <= b.high)
-                for b in order_blocks[tf])):
-                confirmations.pop(tf, None)
-        operational_events = []
-        for tf in [name for name in TIMEFRAMES if name != "M1"] + ["M1"]:
-            candle = current_candles[tf]
-            if candle is not None and candle.complete:
-                operational_events.extend(detect_manipulation_bubble(tf, candle))
+                operational_events.extend(evaluate_structure(tf, candle, detect_bubbles=True))
         for event in filter_m1_confirmation(operational_events):
             if alert_allowed(event.tf, event.direction, event.block_id):
                 enqueue_bubble(event)
