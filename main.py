@@ -515,6 +515,14 @@ def detect_manipulation_bubble(tf, candle):
         if shadow_only:
             continue
 
+        # Only M1 needs the user's triple-entry confirmation. Higher timeframes
+        # notify on their own first intrabar appearance, without bar-close waits.
+        if detected and tf == "M1" and not all(
+            name in confirmations and confirmations[name].direction == direction
+            and time.time() < (int(confirmations[name].timestamp // TIMEFRAMES[name]) + 1) * TIMEFRAMES[name]
+            for name in ("M3", "M5")):
+            continue
+
         if detected:
             event = BubbleEvent(
                 tf=tf,
@@ -1185,10 +1193,11 @@ def health_snapshot():
         "warmup_closed_candles_required": required,
         "history_recovery_complete": all(value == "recovered_provider_ohlcv" for value in history_status.values()),
         "timeframes": list(TIMEFRAMES.keys()),
-        "m1_requires": [],
+        "m1_requires": ["M3", "M5"],
+        "m1_confirmation_direction": "same_direction",
         "alert_trigger": "first_intrabar_appearance",
         "wait_for_candle_close": False,
-        "confirmation_required": False,
+        "confirmation_required": {tf: tf == "M1" for tf in TIMEFRAMES},
         "history_status": dict(history_status),
         "historical_reference": copy.deepcopy(historical_reference),
         "signal_mode": "price_raid_trial" if PRICE_RAID_TRIAL else "luxalgo_reconstruction",

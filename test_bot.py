@@ -141,16 +141,16 @@ class DetectorTests(unittest.TestCase):
         main.load_state()
         self.assertFalse(main.alert_allowed('M15', 'LONG', 'zone'))
 
-    def test_m1_first_appearance_does_not_wait_for_other_timeframes(self):
+    def test_m1_requires_live_m3_and_m5_in_same_direction(self):
         with patch.object(main.time, 'time', return_value=1000):
             for tf in ('M1', 'M3', 'M5'):
                 self.block(tf)
                 self.candle(tf, period=1000 // main.TIMEFRAMES[tf])
             main.detect_manipulation_bubble('M1', main.current_candles['M1'])
-            self.assertEqual(main.bubble_queue.get_nowait().tf, 'M1')
+            self.assertTrue(main.bubble_queue.empty())
             for tf in ('M3', 'M5', 'M1'):
                 main.detect_manipulation_bubble(tf, main.current_candles[tf])
-            self.assertEqual([main.bubble_queue.get_nowait().tf for _ in range(2)], ['M3', 'M5'])
+            self.assertEqual([main.bubble_queue.get_nowait().tf for _ in range(3)], ['M3', 'M5', 'M1'])
             self.assertTrue(main.bubble_queue.empty())
 
     def test_first_appearance_remains_sendable_without_confirmation(self):
@@ -163,6 +163,9 @@ class DetectorTests(unittest.TestCase):
     def test_disappeared_m1_is_delivered_before_candle_close(self):
         self.block('M1')
         candle = self.candle('M1')
+        now = main.time.time()
+        for tf in ('M3', 'M5'):
+            main.confirmations[tf] = main.BubbleEvent(tf, 'LONG', 100, 102, 99, 100, 1, 1, 10, now, 'zone')
         main.detect_manipulation_bubble('M1', candle)
         event = main.bubble_queue.queue[0]
         # The bubble disappears on the next tick while the same bar is open.
@@ -179,12 +182,24 @@ class DetectorTests(unittest.TestCase):
         self.assertIn('M1', job['text'])
         self.assertEqual(len(main.history['M1']), 0)
 
-    def test_health_reports_first_appearance_without_confirmation_gate(self):
+    def test_health_reports_confirmation_only_for_m1(self):
         snap = main.health_snapshot()
-        self.assertEqual(snap['m1_requires'], [])
+        self.assertEqual(snap['m1_requires'], ['M3', 'M5'])
         self.assertEqual(snap['alert_trigger'], 'first_intrabar_appearance')
         self.assertFalse(snap['wait_for_candle_close'])
-        self.assertFalse(snap['confirmation_required'])
+        self.assertTrue(snap['confirmation_required']['M1'])
+        self.assertTrue(all(not snap['confirmation_required'][tf] for tf in ('M15','M30','H1','H4','D1')))
+
+    def test_m1_opposite_or_expired_confirmation_cannot_trigger(self):
+        self.block('M1')
+        candle = self.candle('M1')
+        with patch.object(main.time, 'time', return_value=1000):
+            for direction, stamp in [('SHORT', 1000), ('LONG', 600)]:
+                main.confirmations['M3'] = main.BubbleEvent('M3', direction,100,102,99,100,1,1,10,stamp,'zone')
+                main.confirmations['M5'] = main.BubbleEvent('M5','LONG',100,102,99,100,1,1,10,1000,'zone')
+                main.detect_manipulation_bubble('M1', candle)
+                self.assertTrue(main.bubble_queue.empty())
+            self.assertEqual(main.last_alert, {})
 
     def test_old_tick_does_not_change_price_or_candle(self):
         main.process_tick(100, 1, 1000000)
