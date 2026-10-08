@@ -558,13 +558,14 @@ def build_multi_tf_message(events):
         parts += [format_event(event), ""]
     return "\n".join(parts).rstrip()
 
-def filter_m1_confirmation(events, now=None):
+def filter_m1_confirmation(events, now=None, refresh_confirmations=True):
     """Each higher-TF confirmation expires at its NEXT candle close."""
     now = time.time() if now is None else now
     with state_lock:
-        for event in events:
-            if event.tf in {"M3", "M5"}:
-                confirmations[event.tf] = event
+        if refresh_confirmations:
+            for event in events:
+                if event.tf in {"M3", "M5"}:
+                    confirmations[event.tf] = event
         for tf, event in list(confirmations.items()):
             expiry = (int(event.timestamp // TIMEFRAMES[tf]) + 1) * TIMEFRAMES[tf]
             if now >= expiry:
@@ -590,7 +591,9 @@ def bubble_aggregator():
             pass
         if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
             original_count = len(pending)
-            pending = filter_m1_confirmation(pending)
+            # The detector already maintains live confirmations. A queued event
+            # must not revive a confirmation invalidated by a subsequent tick.
+            pending = filter_m1_confirmation(pending, refresh_confirmations=False)
             if len(pending) < original_count:
                 log.info("M1 scartato: mancano conferme M3/M5 concordi e ancora valide.")
             if not pending:
@@ -659,7 +662,7 @@ def process_tick(price, raw_volume, timestamp_ms):
         timestamp_ms = int(timestamp_ms)
     except (TypeError, ValueError):
         return
-    if not math.isfinite(price) or not math.isfinite(raw_volume) or price <= 0 or timestamp_ms <= 0:
+    if not math.isfinite(price) or not math.isfinite(raw_volume) or price <= 0 or raw_volume < 0 or timestamp_ms <= 0:
         return
     volume = raw_volume if raw_volume > 0 else (1.0 if USE_TICK_VOLUME_FALLBACK else 0.0)
     if volume <= 0:
@@ -667,6 +670,10 @@ def process_tick(price, raw_volume, timestamp_ms):
     timestamp = timestamp_ms / 1000.0
 
     with state_lock:
+        # Delayed/out-of-order trades must not roll back the current price,
+        # refresh feed health, or create a raid in a newer candle.
+        if last_feed_timestamp is not None and timestamp < last_feed_timestamp:
+            return False
         last_tick_time = time.time()
         last_feed_timestamp = timestamp
         last_price = price
@@ -716,6 +723,7 @@ def process_tick(price, raw_volume, timestamp_ms):
             candle = current_candles[tf]
             if candle is not None and candle.complete:
                 detect_manipulation_bubble(tf, candle)
+    return True
 
 def serialize_candle(c):
     return {
@@ -944,8 +952,8 @@ def on_message(ws, message):
     for trade in payload.get("data", []):
         if trade.get("s") == SYMBOL:
             prior_tick = last_tick_time
-            process_tick(trade.get("p"), trade.get("v", 0), trade.get("t"))
-            if last_tick_time is not None:
+            accepted = process_tick(trade.get("p"), trade.get("v", 0), trade.get("t"))
+            if accepted:
                 subscription_verified = True
                 feed_error = None
                 if prior_tick is None:
@@ -956,6 +964,9 @@ def feed_monitor():
         snap = health_snapshot()
         log.info("Stato feed: %s | prezzo=%s | eta_tick=%s | sottoscrizione_verificata=%s",
                  snap["status"], snap["last_price"], snap["last_tick_age_seconds"], snap["subscription_verified"])
+        log.info("Preparazione detector: pronti=%s | candele_chiuse=%s | storico=%s",
+                 ",".join(snap["ready_timeframes"]) or "nessuno",
+                 snap["closed_candles"], snap["history_status"])
 
 def on_error(ws, error):
     global feed_error
@@ -1009,7 +1020,8 @@ def health_snapshot():
         tick_age = None if last_tick_time is None else round(now - last_tick_time, 1)
         active = {tf: sum(1 for b in order_blocks[tf] if b.active) for tf in TIMEFRAMES}
         closed = {tf: len(history[tf]) for tf in TIMEFRAMES}
-        ready = {tf: len(history[tf]) >= max(VOLUME_LOOKBACK, ATR_LENGTH + 1, PIVOT_LENGTH * 2 + 1) for tf in TIMEFRAMES}
+        required = max(MAX_VOLUME_LOOKBACK - 1, VOLUME_LOOKBACK, ATR_LENGTH + 1, PIVOT_LENGTH * 2 + 1)
+        ready = {tf: len(history[tf]) >= required for tf in TIMEFRAMES}
     if feed_error:
         status = "feed_error"
     elif last_tick_time is None:
@@ -1039,11 +1051,15 @@ def health_snapshot():
         "active_blocks": active,
         "closed_candles": closed,
         "ready": ready,
+        "all_timeframes_ready": all(ready.values()),
+        "ready_timeframes": [tf for tf, value in ready.items() if value],
+        "warmup_closed_candles_required": required,
+        "history_recovery_complete": all(value == "recovered_provider_ohlcv" for value in history_status.values()),
         "timeframes": list(TIMEFRAMES.keys()),
         "m1_requires": ["M3", "M5"],
         "confirmation_validity": "until_next_M3_or_M5_candle_close",
         "history_status": dict(history_status),
-        "parity_scope": "closed_bar_logic; upstream volume and session alignment require comparison",
+        "parity_scope": "intrabar_structure_and_bubbles; upstream volume and session alignment require comparison",
         "audit_enabled": AUDIT_ENABLED,
         "audit_file": str(AUDIT_FILE) if AUDIT_ENABLED else None,
     }
@@ -1070,7 +1086,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         snap = health_snapshot()
         path = self.path.split("?", 1)[0]
         if path == "/ready":
-            self._send_json(200 if snap["status"] == "online" else 503, snap)
+            self._send_json(200 if snap["status"] == "online" and snap["all_timeframes_ready"] else 503, snap)
         elif path in {"/", "/health"}:
             self._send_json(200, snap)
         else:

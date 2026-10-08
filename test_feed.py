@@ -1,9 +1,11 @@
 import unittest
 from unittest.mock import patch, Mock
 import main
+import importlib
 
 class FeedTests(unittest.TestCase):
     def setUp(self):
+        importlib.reload(main)
         main.SYMBOL = 'OANDA:XAU_USD'
         main.feed_error = None
         main.last_tick_time = None

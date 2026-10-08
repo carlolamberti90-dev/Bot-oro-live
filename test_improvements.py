@@ -1,9 +1,11 @@
 import unittest
 from unittest.mock import Mock, patch
 import main
+import importlib
 
 class Improvements(unittest.TestCase):
     def setUp(self):
+        importlib.reload(main)
         main.confirmations.clear()
     def event(self, tf, stamp, direction='LONG'):
         return main.BubbleEvent(tf,direction,100,101,99,100,1,1,10,stamp,'test')
