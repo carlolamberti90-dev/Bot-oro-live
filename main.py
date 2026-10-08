@@ -470,8 +470,7 @@ def enqueue_bubble(event):
         log.error("Coda bubble piena: evento scartato.")
 
 def detect_manipulation_bubble(tf, candle):
-    if PRICE_RAID_TRIAL and price_trial is not None:
-        return
+    shadow_only = PRICE_RAID_TRIAL and price_trial is not None
     if not SHOW_MANIPULATION_BUBBLES:
         return
 
@@ -506,7 +505,14 @@ def detect_manipulation_bubble(tf, candle):
                 "volume": candle.volume,
                 "block_id": block.block_id,
                 "candle_period": candle.period,
+                "mode": "luxalgo_shadow" if shadow_only else "luxalgo_reconstruction",
+                "notification_enabled": not shadow_only,
             })
+
+        # Keep every timeframe observable while the price trial is active.
+        # Shadow candidates never confirm M1 or enqueue a Telegram message.
+        if shadow_only:
+            continue
 
         if detected and tf == "M1" and not all(
             name in confirmations and confirmations[name].direction == direction
@@ -1157,6 +1163,11 @@ def health_snapshot():
         "history_status": dict(history_status),
         "historical_reference": copy.deepcopy(historical_reference),
         "signal_mode": "price_raid_trial" if PRICE_RAID_TRIAL else "luxalgo_reconstruction",
+        "shadow_detector_enabled": PRICE_RAID_TRIAL and price_trial is not None,
+        "shadow_timeframes": list(TIMEFRAMES) if PRICE_RAID_TRIAL and price_trial is not None else [],
+        "notification_timeframes": sorted({z['tf'] for z in price_trial.zones.values() if z['active']})
+            if PRICE_RAID_TRIAL and price_trial is not None else ([] if PRICE_RAID_TRIAL else list(TIMEFRAMES)),
+        "luxalgo_parity_verified": False,
         "trial_active_zones": 0 if price_trial is None else sum(z['active'] for z in price_trial.zones.values()),
         "parity_scope": "intrabar_structure_and_bubbles; upstream volume and session alignment require comparison",
         "audit_enabled": AUDIT_ENABLED,
