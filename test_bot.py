@@ -141,23 +141,50 @@ class DetectorTests(unittest.TestCase):
         main.load_state()
         self.assertFalse(main.alert_allowed('M15', 'LONG', 'zone'))
 
-    def test_m1_requires_both_live_confirmations(self):
+    def test_m1_first_appearance_does_not_wait_for_other_timeframes(self):
         with patch.object(main.time, 'time', return_value=1000):
             for tf in ('M1', 'M3', 'M5'):
                 self.block(tf)
                 self.candle(tf, period=1000 // main.TIMEFRAMES[tf])
             main.detect_manipulation_bubble('M1', main.current_candles['M1'])
-            self.assertTrue(main.bubble_queue.empty())
+            self.assertEqual(main.bubble_queue.get_nowait().tf, 'M1')
             for tf in ('M3', 'M5', 'M1'):
                 main.detect_manipulation_bubble(tf, main.current_candles[tf])
-            self.assertEqual([main.bubble_queue.get_nowait().tf for _ in range(3)], ['M3', 'M5', 'M1'])
+            self.assertEqual([main.bubble_queue.get_nowait().tf for _ in range(2)], ['M3', 'M5'])
+            self.assertTrue(main.bubble_queue.empty())
 
-    def test_queue_does_not_revive_invalidated_confirmation(self):
+    def test_first_appearance_remains_sendable_without_confirmation(self):
         event = main.BubbleEvent('M3', 'LONG', 100, 102, 99, 100, 1, 1, 10, 1000, 'zone')
         m1 = main.BubbleEvent('M1', 'LONG', 100, 102, 99, 100, 1, 1, 10, 1001, 'zone')
         main.confirmations['M5'] = main.BubbleEvent('M5', 'LONG', 100, 102, 99, 100, 1, 1, 10, 1000, 'zone')
-        self.assertEqual(main.filter_m1_confirmation([event, m1], now=1002, refresh_confirmations=False), [event])
+        self.assertEqual(main.filter_m1_confirmation([event, m1], now=1002, refresh_confirmations=False), [event, m1])
         self.assertNotIn('M3', main.confirmations)
+
+    def test_disappeared_m1_is_delivered_before_candle_close(self):
+        self.block('M1')
+        candle = self.candle('M1')
+        main.detect_manipulation_bubble('M1', candle)
+        event = main.bubble_queue.queue[0]
+        # The bubble disappears on the next tick while the same bar is open.
+        candle.close = 98
+        main.invalidate_blocks('M1', candle)
+        original = main.enqueue_telegram
+        def enqueue_and_stop(*args):
+            original(*args)
+            main.shutdown_event.set()
+        with patch.object(main, 'enqueue_telegram', side_effect=enqueue_and_stop):
+            main.bubble_aggregator()
+        job = main.telegram_queue.get_nowait()
+        self.assertEqual(job['event_ids'], [event.event_id])
+        self.assertIn('M1', job['text'])
+        self.assertEqual(len(main.history['M1']), 0)
+
+    def test_health_reports_first_appearance_without_confirmation_gate(self):
+        snap = main.health_snapshot()
+        self.assertEqual(snap['m1_requires'], [])
+        self.assertEqual(snap['alert_trigger'], 'first_intrabar_appearance')
+        self.assertFalse(snap['wait_for_candle_close'])
+        self.assertFalse(snap['confirmation_required'])
 
     def test_old_tick_does_not_change_price_or_candle(self):
         main.process_tick(100, 1, 1000000)

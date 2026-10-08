@@ -13,17 +13,18 @@ class Improvements(unittest.TestCase):
         main.filter_m1_confirmation([self.event('M3',900),self.event('M5',900)],now=904)
         event=self.event('M1',960)
         self.assertEqual(main.filter_m1_confirmation([event],now=964),[event])
-    def test_expired_confirmation_blocks_m1(self):
+    def test_expired_confirmation_does_not_block_m1(self):
         main.filter_m1_confirmation([self.event('M3',900),self.event('M5',900)],now=904)
-        self.assertEqual(main.filter_m1_confirmation([self.event('M1',1080)],now=1084),[])
-    def test_opposite_confirmation_blocks_m1(self):
-        self.assertEqual(main.filter_m1_confirmation([self.event('M1',900), self.event('M3',900),self.event('M5',900,'SHORT')],now=904)[0].tf,'M3')
+        event = self.event('M1',1080)
+        self.assertEqual(main.filter_m1_confirmation([event],now=1084),[event])
+    def test_opposite_confirmation_does_not_block_m1(self):
+        self.assertEqual(main.filter_m1_confirmation([self.event('M1',900), self.event('M3',900),self.event('M5',900,'SHORT')],now=904)[0].tf,'M1')
     def test_same_close_order_independent(self):
         events=[self.event('M1',900),self.event('M5',900),self.event('M3',900)]
         self.assertEqual(main.filter_m1_confirmation(events,now=904),events)
-    def test_future_confirmation_cannot_validate_old_m1(self):
+    def test_event_delivery_independent_of_future_confirmation(self):
         events=[self.event('M1',840),self.event('M3',900),self.event('M5',900)]
-        self.assertNotIn(events[0],main.filter_m1_confirmation(events,now=904))
+        self.assertIn(events[0],main.filter_m1_confirmation(events,now=904))
     def payload(self):
         return dict(s='ok',t=[0,60,120],o=[100]*3,h=[102]*3,l=[99]*3,c=[101]*3,v=[10]*3)
     def test_parse_excludes_open_candle(self):

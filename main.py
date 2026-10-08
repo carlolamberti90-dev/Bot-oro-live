@@ -515,12 +515,6 @@ def detect_manipulation_bubble(tf, candle):
         if shadow_only:
             continue
 
-        if detected and tf == "M1" and not all(
-            name in confirmations and confirmations[name].direction == direction
-            and time.time() < (int(confirmations[name].timestamp // TIMEFRAMES[name]) + 1) * TIMEFRAMES[name]
-            for name in ("M3", "M5")):
-            continue
-
         if detected:
             event = BubbleEvent(
                 tf=tf,
@@ -588,21 +582,8 @@ def build_multi_tf_message(events):
     return "\n".join(parts).rstrip()
 
 def filter_m1_confirmation(events, now=None, refresh_confirmations=True):
-    """Each higher-TF confirmation expires at its NEXT candle close."""
-    now = time.time() if now is None else now
-    with state_lock:
-        if refresh_confirmations:
-            for event in events:
-                if event.tf in {"M3", "M5"}:
-                    confirmations[event.tf] = event
-        for tf, event in list(confirmations.items()):
-            expiry = (int(event.timestamp // TIMEFRAMES[tf]) + 1) * TIMEFRAMES[tf]
-            if now >= expiry:
-                confirmations.pop(tf, None)
-        return [event for event in events if event.tf != "M1" or all(
-            tf in confirmations and confirmations[tf].direction == event.direction
-            and confirmations[tf].timestamp <= event.timestamp
-            for tf in ("M3", "M5"))]
+    """Compatibility helper: first appearances never wait for confirmation."""
+    return list(events)
 
 def bubble_aggregator():
     global last_alert_time
@@ -619,15 +600,7 @@ def bubble_aggregator():
         except queue.Empty:
             pass
         if pending and first_time is not None and time.time() - first_time >= MULTI_TF_WINDOW_SECONDS:
-            original_count = len(pending)
-            # The detector already maintains live confirmations. A queued event
-            # must not revive a confirmation invalidated by a subsequent tick.
-            pending = filter_m1_confirmation(pending, refresh_confirmations=False)
-            if len(pending) < original_count:
-                log.info("M1 scartato: mancano conferme M3/M5 concordi e ancora valide.")
-            if not pending:
-                first_time = None
-                continue
+            # A later disappearance must not erase an observed first appearance.
             pending.sort(key=lambda e: tf_order.get(e.tf, 999))
             message = build_multi_tf_message(pending)
             enqueue_telegram(message, [event.event_id for event in pending])
@@ -646,7 +619,7 @@ def bubble_aggregator():
                     } for e in pending
                 ],
             })
-            log.info("Bubble confermate: %s", ", ".join(f"{e.tf}-{e.direction}" for e in pending))
+            log.info("Prime comparse bubble intrabar: %s", ", ".join(f"{e.tf}-{e.direction}" for e in pending))
             pending = []
             first_time = None
 
@@ -1212,8 +1185,10 @@ def health_snapshot():
         "warmup_closed_candles_required": required,
         "history_recovery_complete": all(value == "recovered_provider_ohlcv" for value in history_status.values()),
         "timeframes": list(TIMEFRAMES.keys()),
-        "m1_requires": ["M3", "M5"],
-        "confirmation_validity": "until_next_M3_or_M5_candle_close",
+        "m1_requires": [],
+        "alert_trigger": "first_intrabar_appearance",
+        "wait_for_candle_close": False,
+        "confirmation_required": False,
         "history_status": dict(history_status),
         "historical_reference": copy.deepcopy(historical_reference),
         "signal_mode": "price_raid_trial" if PRICE_RAID_TRIAL else "luxalgo_reconstruction",
