@@ -68,6 +68,35 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(main.telegram_queue.empty())
         self.assertTrue(main.bubble_queue.empty())
 
+    def test_trial_keeps_all_timeframes_in_shadow_without_notifications(self):
+        main.PRICE_RAID_TRIAL = True
+        main.price_trial = main.PriceRaidTrial({}, main.candle_period)
+        main.AUDIT_ENABLED = True
+        main.AUDIT_FILE = Path(self.temp.name) / 'shadow.jsonl'
+        for tf in main.TIMEFRAMES:
+            self.block(tf)
+            candle = self.candle(tf)
+            main.detect_manipulation_bubble(tf, candle)
+            main.detect_manipulation_bubble(tf, candle)
+        records = [json.loads(line) for line in main.AUDIT_FILE.read_text().splitlines()]
+        self.assertEqual({r['tf'] for r in records}, set(main.TIMEFRAMES))
+        self.assertEqual(len(records), len(main.TIMEFRAMES))
+        self.assertTrue(all(r['mode'] == 'luxalgo_shadow' and not r['notification_enabled'] for r in records))
+        self.assertTrue(main.bubble_queue.empty())
+        self.assertTrue(main.telegram_queue.empty())
+        self.assertEqual(main.confirmations, {})
+        self.assertEqual(main.last_alert, {})
+
+    def test_health_distinguishes_trial_notifications_from_shadow_coverage(self):
+        main.PRICE_RAID_TRIAL = True
+        main.price_trial = main.PriceRaidTrial({'M15': {'zones': [dict(
+            block_id='trial-zone', low=99, high=102, bullish=False)]}}, main.candle_period)
+        snap = main.health_snapshot()
+        self.assertEqual(snap['notification_timeframes'], ['M15'])
+        self.assertEqual(snap['shadow_timeframes'], list(main.TIMEFRAMES))
+        self.assertTrue(snap['shadow_detector_enabled'])
+        self.assertFalse(snap['luxalgo_parity_verified'])
+
     def candle(self, tf='M15', period=1, low=98, high=103, close=100):
         candle = main.Candle(period, period * main.TIMEFRAMES[tf], 100, high, low, close, 10)
         main.current_candles[tf] = candle
