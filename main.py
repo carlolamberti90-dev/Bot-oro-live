@@ -10,6 +10,7 @@ import collections
 import math
 import copy
 import hashlib
+import signal
 from datetime import datetime, time as daytime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from pathlib import Path
 import requests
 import websocket
 from price_trial import PriceRaidTrial, format_trial
+from history_store import HistoryStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("xau-lux-bubble")
@@ -116,7 +118,9 @@ price_trial = None
 restored_trial_state = None
 
 current_candles = {tf: None for tf in TIMEFRAMES}
-history = {tf: collections.deque(maxlen=MAX_HISTORY) for tf in TIMEFRAMES}
+HISTORY_LIMITS = {tf: max(MAX_HISTORY, math.ceil(7 * 86400 / seconds)) for tf, seconds in TIMEFRAMES.items()}
+history_store = HistoryStore(SYMBOL)
+history = {tf: collections.deque(maxlen=HISTORY_LIMITS[tf]) for tf in TIMEFRAMES}
 order_blocks = {tf: [] for tf in TIMEFRAMES}
 last_pivot_high = {tf: None for tf in TIMEFRAMES}
 last_pivot_low = {tf: None for tf in TIMEFRAMES}
@@ -691,6 +695,8 @@ def process_tick(price, raw_volume, timestamp_ms):
             period = candle_period(tf, timestamp)
             candle = current_candles[tf]
             if candle is None:
+                if history[tf] and period > history[tf][-1].period + 1:
+                    history_status[tf] = "gap_unrecovered"
                 current_candles[tf] = new_candle(period, timestamp, price, volume)
                 current_candles[tf].complete = False
                 continue
@@ -789,17 +795,27 @@ def save_state():
             for mapping, value in zip(STRUCTURE_MAPS, values):
                 mapping[tf] = value
     try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         tmp.replace(STATE_FILE)
     except Exception as exc:
         log.warning("Persistenza stato non disponibile: %s", exc)
+    history_store.save(payload, force=shutdown_event.is_set())
 
 def load_state():
     global restored_trial_state
-    if not STATE_FILE.exists():
+    remote = history_store.load()
+    local = None
+    if STATE_FILE.exists():
+        try:
+            local = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            log.warning("Cache storico locale non leggibile")
+    candidates = [p for p in (local, remote) if p is not None]
+    if not candidates:
         return
     try:
-        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        payload = max(candidates, key=lambda p: p.get("saved_at", 0))
         restored_trial_state = payload.get("price_trial")
         with state_lock:
             for tf in TIMEFRAMES:
@@ -809,7 +825,7 @@ def load_state():
                     history_status[tf] = "alignment_changed_requires_history"
                     continue
                 history[tf].clear()
-                for item in payload.get("history", {}).get(tf, [])[-MAX_HISTORY:]:
+                for item in payload.get("history", {}).get(tf, [])[-HISTORY_LIMITS[tf]:]:
                     history[tf].append(deserialize_candle(item))
                 order_blocks[tf] = [
                     OrderBlock(**b) for b in payload.get("order_blocks", {}).get(tf, [])
@@ -830,7 +846,7 @@ def load_state():
                 last_pivot_low_candle[tf] = next((x for x in history[tf] if x.period == low_period), None)
             for tf in TIMEFRAMES:
                 committed_structure[tf] = snapshot_structure(tf)
-        log.info("Stato ripristinato da %s", STATE_FILE)
+        log.info("Storico e struttura ripristinati senza invio di segnali passati: %s candele", {tf: len(history[tf]) for tf in TIMEFRAMES})
     except Exception as exc:
         log.warning("Impossibile ripristinare lo stato: %s", exc)
 
@@ -986,7 +1002,7 @@ def recover_history():
                 last_pivot_high[tf] = last_pivot_low[tf] = None
                 last_pivot_high_candle[tf] = last_pivot_low_candle[tf] = None
                 trend_state[tf] = 0
-                for candle in candles[-MAX_HISTORY:]:
+                for candle in candles[-HISTORY_LIMITS[tf]:]:
                     close_candle(tf, candle, notify=False)
                 current_candles[tf] = None
                 history_status[tf] = "recovered_provider_ohlcv"
@@ -1199,6 +1215,12 @@ def health_snapshot():
         "wait_for_candle_close": False,
         "confirmation_required": {tf: tf == "M1" for tf in TIMEFRAMES},
         "history_status": dict(history_status),
+        "history_storage": {"backend": "postgres" if history_store.url else "local_ephemeral",
+                            "status": history_store.status, "last_saved_at": history_store.last_saved_at,
+                            "retention_candles": HISTORY_LIMITS},
+        "history_coverage": {tf: {"count": len(history[tf]),
+            "first_timestamp": history[tf][0].timestamp if history[tf] else None,
+            "last_timestamp": history[tf][-1].timestamp if history[tf] else None} for tf in TIMEFRAMES},
         "historical_reference": copy.deepcopy(historical_reference),
         "signal_mode": "price_raid_trial" if PRICE_RAID_TRIAL else "luxalgo_reconstruction",
         "shadow_detector_enabled": PRICE_RAID_TRIAL and price_trial is not None,
@@ -1248,6 +1270,12 @@ def health_server():
 def main():
     global price_trial
     validate_config()
+    def stop_service(signum, frame):
+        shutdown_event.set()
+        if active_socket is not None:
+            active_socket.close()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop_service)
     load_state()
     load_historical_reference()
     if PRICE_RAID_TRIAL:
