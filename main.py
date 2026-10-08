@@ -410,7 +410,7 @@ def add_order_block(tf, pivot_candle, bullish):
                 old.active = False
 
     blocks.append(block)
-    active = sorted((b for b in blocks if b.active), key=lambda b: b.created_period)
+    active = [b for b in blocks if b.active]  # Pine array.shift evicts by creation order.
     while len(active) > MAX_RECENT_BLOCKS:
         active.pop(0).active = False
     prune_blocks(tf)
@@ -495,7 +495,7 @@ def enqueue_bubble(event):
     except queue.Full:
         log.error("Coda bubble piena: evento scartato.")
 
-def detect_manipulation_bubble(tf, candle):
+def detect_manipulation_bubble(tf, candle, emit=True):
     shadow_only = PRICE_RAID_TRIAL and price_trial is not None
     operational_events = []
     if tf not in ALERT_TIMEFRAMES or not SHOW_MANIPULATION_BUBBLES:
@@ -557,7 +557,7 @@ def detect_manipulation_bubble(tf, candle):
                 event_id=event_id,
                 feed_timestamp=last_feed_timestamp or candle.timestamp,
             )
-            if tf in OPERATIONAL_TIMEFRAMES:
+            if not emit or tf in OPERATIONAL_TIMEFRAMES:
                 operational_events.append(event)
             elif alert_allowed(tf, direction, block.block_id):
                 enqueue_bubble(event)
@@ -680,9 +680,15 @@ def evaluate_structure(tf, candle, detect_bubbles=False):
     detect_new_pivots(tf, candle)
     invalidate_blocks(tf, candle)
     # Pine checks manipulation on existing blocks BEFORE creating breakout blocks.
-    events = detect_manipulation_bubble(tf, candle) if detect_bubbles else []
+    events = detect_manipulation_bubble(tf, candle, emit=False) if detect_bubbles else []
     detect_structure_break(tf, candle, previous_high, previous_low)
-    return events
+    # A label deleted by overlap/FIFO in this same Pine execution is never rendered.
+    active_ids = {block.block_id for block in order_blocks[tf] if block.active}
+    surviving = [event for event in events if event.block_id in active_ids]
+    for event in surviving:
+        if event.tf not in OPERATIONAL_TIMEFRAMES and alert_allowed(tf, event.direction, event.block_id):
+            enqueue_bubble(event)
+    return [event for event in surviving if event.tf in OPERATIONAL_TIMEFRAMES]
 
 def close_candle(tf, candle, notify=True):
     restore_committed_structure(tf)
