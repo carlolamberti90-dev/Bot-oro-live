@@ -45,14 +45,14 @@ SHOW_MANIPULATION_BUBBLES = True
 MAX_VOLUME_LOOKBACK = 200
 MULTI_TF_WINDOW_SECONDS = 0.05
 SAME_BUBBLE_COOLDOWN_SECONDS = 300
-ALERT_TIMEFRAMES = {"M3", "M5", "M15", "M30", "H1", "H4", "D1"}
+ALERT_TIMEFRAMES = {"M3", "M5", "M15", "M30", "M45", "H1", "H4", "D1"}
 OPERATIONAL_TIMEFRAMES = set()
 MAX_HISTORY = 300
 USE_TICK_VOLUME_FALLBACK = True
 
 TIMEFRAMES = {
     "M1": 60, "M3": 180, "M5": 300, "M15": 900,
-    "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
+    "M30": 1800, "M45": 2700, "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
 }
 
 def candle_period(tf, timestamp):
@@ -1064,6 +1064,7 @@ def recover_history():
                 raise ValueError(f"history_http_{response.status_code}")
             retrieved[tf] = parse_forex_candles(response.json(), seconds, cutoff)
         retrieved["M3"] = aggregate_history(retrieved["M1"], 60, 180)
+        retrieved["M45"] = aggregate_history(retrieved["M15"], 900, 2700)
         retrieved["H4"] = aggregate_history(retrieved["H1"], 3600, 14400)
         with state_lock:
             confirmations.clear()
@@ -1125,7 +1126,8 @@ def on_message(ws, message):
             if accepted:
                 if PRICE_RAID_TRIAL and price_trial is not None:
                     with state_lock:
-                        events = price_trial.process(last_price, last_feed_timestamp)
+                        events = [event for event in price_trial.process(last_price, last_feed_timestamp)
+                                  if event["tf"] in ALERT_TIMEFRAMES]
                     if events:
                         enqueue_telegram(format_trial(events), [e['event_id'] for e in events])
                         audit_write({'type': 'telegram_enqueued', 'mode': 'price_raid_trial',
@@ -1357,7 +1359,7 @@ def main():
     load_historical_reference()
     if PRICE_RAID_TRIAL:
         trial_references = {tf: reference for tf, reference in historical_reference.items()
-                            if tf in {"M15", "M30", "H1", "H4"}}
+                            if tf in ALERT_TIMEFRAMES}
         price_trial = PriceRaidTrial(trial_references, candle_period, restored_trial_state)
         log.info("PROVA prezzo: %s zone OANDA di riferimento; superamento/rientro live, senza filtro volume; validita storica non verificata",
                  len(price_trial.zones))
