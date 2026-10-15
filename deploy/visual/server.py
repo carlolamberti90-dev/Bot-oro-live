@@ -40,6 +40,26 @@ def valid_session(raw):
         return False
 
 
+def same_origin(headers):
+    external = os.getenv('RENDER_EXTERNAL_URL','').rstrip('/')
+    expected = external or 'https://' + headers.get('Host','')
+    return headers.get('Origin','') == expected
+
+
+def login_csrf_valid(headers, fields):
+    try:
+        cookies=SimpleCookie();cookies.load(headers.get('Cookie',''))
+        cookie=cookies['__Host-monitor_csrf'].value
+        token=fields.get('csrf',[''])[0]
+        # iOS in-app views can omit Origin or send null. A random double-submit
+        # token still binds submission to a form read from this origin.
+        origin=headers.get('Origin','')
+        origin_ok=origin in ('','null') or same_origin(headers)
+        return origin_ok and len(cookie) >= 40 and hmac.compare_digest(cookie.encode(),token.encode())
+    except (KeyError,ValueError,TypeError):
+        return False
+
+
 def authorized(header, password):
     if len(password) < 24:
         return False
@@ -190,11 +210,20 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(401,{'error':'authentication_required'})
         return False
 
+    def show_login(self, code=200, incorrect=False):
+        token=secrets.token_urlsafe(32)
+        page=LOGIN_PAGE.replace(b'<p><label>Utente',
+            ('<input type="hidden" name="csrf" value="'+token+'"><p><label>Utente').encode(),1)
+        if incorrect:
+            page=page.replace(b'<h1>',b'<p>Credenziali non corrette. Riprova.</p><h1>',1)
+        return self.reply(code,page,'text/html; charset=utf-8',extra_headers={
+            'Set-Cookie':'__Host-monitor_csrf='+token+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=900'})
+
     def do_GET(self):
         if self.path == '/health':
             return self.reply(200,{'service':'setup_available','monitor_operational':False})
         if self.path == '/login' or (self.path == '/' and not valid_session(self.headers.get('Cookie')) and not authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD',''))):
-            return self.reply(200,LOGIN_PAGE,'text/html; charset=utf-8')
+            return self.show_login()
         if not self.access():
             return
         try:
@@ -212,26 +241,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/login':
-            if self.headers.get('Origin') != 'https://' + self.headers.get('Host',''):
-                return self.reply(403,{'error':'origin_rejected'})
             try:
                 length=int(self.headers.get('Content-Length','0'))
                 if not 0 < length <= 10000:
                     return self.reply(413,{'error':'invalid_body_size'})
                 fields=parse_qs(self.rfile.read(length).decode())
+                if not login_csrf_valid(self.headers,fields):
+                    return self.show_login(403)
                 username=fields.get('username',[''])[0].strip().casefold()
                 password=fields.get('password',[''])[0].strip()
                 expected=os.getenv('SETUP_PASSWORD','')
                 if username != 'carlo' or len(expected) < 24 or not hmac.compare_digest(password.encode(),expected.encode()):
-                    return self.reply(401,LOGIN_PAGE.replace(b'<h1>',b'<p>Credenziali non corrette. Riprova.</p><h1>',1),'text/html; charset=utf-8')
+                    return self.show_login(401,incorrect=True)
                 return self.reply(303,b'',extra_headers={'Location':'/','Set-Cookie':'monitor_session='+session_cookie()+'; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800'})
             except (ValueError,UnicodeError):
                 return self.reply(400,{'error':'invalid_login'})
         if not self.access():
             return
         # Same-origin fetch only, including protection against authenticated CSRF.
-        origin=self.headers.get('Origin','')
-        if origin != 'https://' + self.headers.get('Host','') or self.headers.get('X-Monitor-Action') != '1':
+        if not same_origin(self.headers) or self.headers.get('X-Monitor-Action') != '1':
             return self.reply(403,{'error':'origin_rejected'})
         try:
             length=int(self.headers.get('Content-Length','0'))

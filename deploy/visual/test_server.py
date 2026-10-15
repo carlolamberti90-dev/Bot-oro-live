@@ -1,13 +1,14 @@
 import base64
 import http.client
 import os
+import re
 import threading
 import unittest
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
-from server import Handler, authorized, valid_session
+from server import Handler, authorized, valid_session, login_csrf_valid, same_origin
 
 class Fake:
     def __init__(self):self.calls=[]
@@ -42,7 +43,10 @@ class SecurityTests(unittest.TestCase):
     def login(self,body,origin=None):
         conn=http.client.HTTPConnection('127.0.0.1',self.server.server_port)
         host='127.0.0.1:'+str(self.server.server_port)
-        conn.request('POST','/login',body,{'Origin':origin or 'https://'+host,'Content-Type':'application/x-www-form-urlencoded'})
+        with self.request('/') as page:
+            cookie=page.headers['Set-Cookie'].split(';')[0]
+            token=re.search(b'name="csrf" value="([^"]+)"',page.read()).group(1).decode()
+        conn.request('POST','/login',body+'&csrf='+token,{'Origin':origin or 'https://'+host,'Cookie':cookie,'Content-Type':'application/x-www-form-urlencoded'})
         return conn,conn.getresponse()
     def test_form_login_sets_secure_session_and_authorizes_status(self):
         conn,r=self.login('username=Carlo&password='+self.password)
@@ -55,8 +59,24 @@ class SecurityTests(unittest.TestCase):
     def test_wrong_password_and_cross_origin_do_not_set_cookie(self):
         for body,origin,code in [('username=carlo&password=wrong',None,401),('username=carlo&password='+self.password,'https://evil.example',403)]:
             conn,r=self.login(body,origin)
-            self.assertEqual(r.status,code);self.assertIsNone(r.getheader('Set-Cookie'))
+            self.assertEqual(r.status,code);self.assertNotIn('monitor_session=',r.getheader('Set-Cookie',''))
             r.read();conn.close()
+    def test_null_and_missing_origin_require_matching_csrf_cookie(self):
+        token='a'*43
+        for origin in ('null',''):
+            headers={'Origin':origin,'Cookie':'__Host-monitor_csrf='+token}
+            self.assertTrue(login_csrf_valid(headers,{'csrf':[token]}))
+            self.assertFalse(login_csrf_valid(headers,{'csrf':['wrong']}))
+            self.assertFalse(login_csrf_valid({'Origin':origin},{'csrf':[token]}))
+        self.assertFalse(login_csrf_valid({'Origin':'https://evil.example','Cookie':'__Host-monitor_csrf='+token},{'csrf':[token]}))
+    def test_render_external_origin_matches_even_with_internal_host(self):
+        with patch.dict(os.environ,{'RENDER_EXTERNAL_URL':'https://monitor.onrender.com'}):
+            self.assertTrue(same_origin({'Origin':'https://monitor.onrender.com','Host':'internal:10000'}))
+            self.assertFalse(same_origin({'Origin':'https://evil.example','Host':'internal:10000'}))
+    def test_null_origin_can_finish_real_form_login(self):
+        conn,r=self.login('username=carlo&password='+self.password,'null')
+        self.assertEqual(r.status,303);self.assertIn('monitor_session=',r.getheader('Set-Cookie',''))
+        r.read();conn.close()
     def test_health_is_public_but_does_not_claim_operational(self):
         with self.request('/health') as r:
             self.assertEqual(r.status,200);self.assertIn(b'false',r.read())
