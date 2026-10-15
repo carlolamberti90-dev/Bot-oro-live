@@ -1,9 +1,11 @@
 """Authenticated setup browser and monitor launcher; no browser profile export."""
 import base64
 import hmac
+import hashlib
 import json
 import os
 import queue
+import secrets
 import subprocess
 import sys
 import threading
@@ -11,9 +13,31 @@ import time
 from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv('MONITOR_DATA_DIR', '/tmp/bubble-monitor'))
+SESSION_KEY = secrets.token_bytes(32)
+LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
+
+
+def session_cookie():
+    payload = str(int(time.time()) + 8 * 3600) + '.' + secrets.token_hex(16)
+    signature = hmac.new(SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    return payload + '.' + signature
+
+
+def valid_session(raw):
+    try:
+        cookie = SimpleCookie(); cookie.load(raw or '')
+        value = cookie['monitor_session'].value
+        expiry, nonce, signature = value.split('.')
+        payload = expiry + '.' + nonce
+        expected = hmac.new(SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+        return int(expiry) > time.time() and hmac.compare_digest(signature, expected)
+    except (KeyError, ValueError, TypeError):
+        return False
 
 
 def authorized(header, password):
@@ -144,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # No URLs, Authorization headers or typed login data in logs.
 
-    def reply(self, code, body, kind='application/json'):
+    def reply(self, code, body, kind='application/json', extra_headers=None):
         if isinstance(body, dict):
             body = json.dumps(body).encode()
         self.send_response(code)
@@ -154,14 +178,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options','DENY')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-        if code == 401:
-            self.send_header('WWW-Authenticate','Basic realm="Monitor oro", charset="UTF-8"')
+        for key,value in (extra_headers or {}).items():
+            self.send_header(key,value)
         self.send_header('Content-Length',str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def access(self):
-        if authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD','')):
+        if valid_session(self.headers.get('Cookie')) or authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD','')):
             return True
         self.reply(401,{'error':'authentication_required'})
         return False
@@ -169,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
             return self.reply(200,{'service':'setup_available','monitor_operational':False})
+        if self.path == '/login' or (self.path == '/' and not valid_session(self.headers.get('Cookie')) and not authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD',''))):
+            return self.reply(200,LOGIN_PAGE,'text/html; charset=utf-8')
         if not self.access():
             return
         try:
@@ -185,6 +211,22 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(409,{'error':'action_unavailable; inspect status'})
 
     def do_POST(self):
+        if self.path == '/login':
+            if self.headers.get('Origin') != 'https://' + self.headers.get('Host',''):
+                return self.reply(403,{'error':'origin_rejected'})
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0 < length <= 10000:
+                    return self.reply(413,{'error':'invalid_body_size'})
+                fields=parse_qs(self.rfile.read(length).decode())
+                username=fields.get('username',[''])[0].strip().casefold()
+                password=fields.get('password',[''])[0].strip()
+                expected=os.getenv('SETUP_PASSWORD','')
+                if username != 'carlo' or len(expected) < 24 or not hmac.compare_digest(password.encode(),expected.encode()):
+                    return self.reply(401,LOGIN_PAGE.replace(b'<h1>',b'<p>Credenziali non corrette. Riprova.</p><h1>',1),'text/html; charset=utf-8')
+                return self.reply(303,b'',extra_headers={'Location':'/','Set-Cookie':'monitor_session='+session_cookie()+'; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800'})
+            except (ValueError,UnicodeError):
+                return self.reply(400,{'error':'invalid_login'})
         if not self.access():
             return
         # Same-origin fetch only, including protection against authenticated CSRF.
