@@ -1,0 +1,111 @@
+{
+  "scan_interval_seconds": 5,
+  "chart_timezone": "Europe/Rome",
+  "associate_data_window": true,
+  "live_validation_completed": false,
+  "charts": {
+    "M1": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 1 minute",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "M3": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 3 minutes",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "M5": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 5 minutes",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "M15": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 15 minutes",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "M30": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 30 minutes",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "M45": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 45 minutes",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "H1": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 1 hour",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "H4": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 4 hours",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    },
+    "D1": {
+      "url": "https://www.tradingview.com/chart/veRzCbwr/",
+      "chart_label": "Chart for OANDA:XAUUSD, 1 day",
+      "roi": [
+        55,
+        200,
+        940,
+        740
+      ]
+    }
+  },
+  "analytical_audit_file": "/data/bubble_audit.jsonl",
+  "pilot_mode": true,
+  "active_timeframes": [
+    "M3",
+    "M5",
+    "M15",
+    "M30",
+    "M45",
+    "H1",
+    "H4",
+    "D1"
+  ],
+  "sequential_tab_mode": true
+}
