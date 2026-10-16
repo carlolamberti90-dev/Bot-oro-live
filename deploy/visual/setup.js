@@ -1,6 +1,6 @@
 const byId=id=>document.getElementById(id);
 let imageUrl=null;
-async function status(){const r=await fetch('/status');if(!r.ok)throw Error('Accesso richiesto');const s=await r.json();byId('status').textContent=JSON.stringify(s,null,2);return s;}
+async function status(){const r=await fetch('/status');if(!r.ok)throw Error('Accesso richiesto');const s=await r.json();byId('status').textContent=JSON.stringify(s,null,2);const ready=s.browser_open&&!s.monitor_running;byId('type').disabled=!ready;document.querySelectorAll('[data-key],[data-scroll]').forEach(b=>b.disabled=!ready);if(!s.browser_open){byId('screen').removeAttribute('src');byId('message').textContent='Il browser si è chiuso. Premi Apri TradingView prima di inserire dati.';}return s;}
 async function frame(){const r=await fetch('/frame');if(!r.ok)throw Error('Apri il browser o ferma prima il monitor');const next=URL.createObjectURL(await r.blob());byId('screen').src=next;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=next;}
 async function action(action,values={}){byId('message').textContent='Operazione in corso…';const r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body:JSON.stringify({action,...values})});if(!r.ok)throw Error('Operazione non completata. Controlla lo stato.');byId('message').textContent='Operazione completata; verifica il risultato.';await status();}
 function safe(fn){return async()=>{try{await fn();}catch(e){byId('message').textContent=e.message;}};}
