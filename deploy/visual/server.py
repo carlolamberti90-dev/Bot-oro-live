@@ -19,24 +19,39 @@ from urllib.parse import parse_qs
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv('MONITOR_DATA_DIR', '/tmp/bubble-monitor'))
-SESSION_KEY = secrets.token_bytes(32)
+SESSION_TTL = 8 * 3600
+REMEMBER_TTL = 30 * 24 * 3600
+
+
+def session_key():
+    # Stable across host replacement; rotating the existing password revokes sessions.
+    password = os.getenv('SETUP_PASSWORD', '')
+    if len(password) < 24:
+        return None
+    return hmac.new(password.encode(), b'bubble-monitor/session-signing/v1', hashlib.sha256).digest()
 LOG = logging.getLogger('bubble_monitor')
-LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
+LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><p><label><input name="remember" type="checkbox" value="1"> Ricordami su questo dispositivo per 30 giorni</label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
 
 
-def session_cookie():
-    payload = str(int(time.time()) + 8 * 3600) + '.' + secrets.token_hex(16)
-    signature = hmac.new(SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+def session_cookie(remember=False):
+    key = session_key()
+    if key is None:
+        raise ValueError('session_key_unavailable')
+    payload = str(int(time.time()) + (REMEMBER_TTL if remember else SESSION_TTL)) + '.' + secrets.token_hex(16)
+    signature = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
     return payload + '.' + signature
 
 
 def valid_session(raw):
     try:
+        key = session_key()
+        if key is None:
+            return False
         cookie = SimpleCookie(); cookie.load(raw or '')
         value = cookie['monitor_session'].value
         expiry, nonce, signature = value.split('.')
         payload = expiry + '.' + nonce
-        expected = hmac.new(SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
         return int(expiry) > time.time() and hmac.compare_digest(signature, expected)
     except (KeyError, ValueError, TypeError):
         return False
@@ -316,7 +331,9 @@ class Handler(BaseHTTPRequestHandler):
                 expected=os.getenv('SETUP_PASSWORD','')
                 if username != 'carlo' or len(expected) < 24 or not hmac.compare_digest(password.encode(),expected.encode()):
                     return self.show_login(401,incorrect=True)
-                return self.reply(303,b'',extra_headers={'Location':'/','Set-Cookie':'monitor_session='+session_cookie()+'; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800'})
+                remember = fields.get('remember', [''])[0] == '1'
+                ttl = REMEMBER_TTL if remember else SESSION_TTL
+                return self.reply(303,b'',extra_headers={'Location':'/','Set-Cookie':'monitor_session='+session_cookie(remember)+'; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age='+str(ttl)})
             except (ValueError,UnicodeError):
                 return self.reply(400,{'error':'invalid_login'})
         if not self.access():
