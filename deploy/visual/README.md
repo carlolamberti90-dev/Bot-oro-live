@@ -36,3 +36,14 @@ Non costituisce monitor persistente 24/7. Dopo una perdita del disco occorre
 rifare login e baseline. Non viene attivato alcun artificio per tenere sveglio
 il servizio. Per permanenza serve un host con disco persistente e accesso privato.
 Non inviare segreti nella chat: usare i campi Environment del servizio Render.
+
+## Recupero del processo
+
+Il pannello salva l'intenzione di esecuzione solo dopo un avvio esplicito. Un
+processo terminato viene rilanciato al massimo tre volte, con attese crescenti.
+Stop annulla la ripartenza. Al riavvio del pannello l'intenzione viene riletta
+solo se la directory dati esiste ancora: questo non rende persistente Render Free.
+Il profilo TradingView resta esclusivamente nella directory del server.
+/status espone codice di uscita, tentativi e freschezza delle catture; catture
+più vecchie di dieci minuti o un processo terminato non dichiarano operatività.
+I log riportano azioni e tipi di errore, senza credenziali o contenuto digitato.

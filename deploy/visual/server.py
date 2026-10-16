@@ -3,6 +3,7 @@ import base64
 import hmac
 import hashlib
 import json
+import logging
 import os
 import queue
 import secrets
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv('MONITOR_DATA_DIR', '/tmp/bubble-monitor'))
 SESSION_KEY = secrets.token_bytes(32)
+LOG = logging.getLogger('bubble_monitor')
 LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
 
 
@@ -77,18 +79,73 @@ class Controller:
         self.driver = None
         self.error = None
         self.started = None
+        self.desired = None
+        self.restart_attempts = 0
+        self.retry_at = 0
+        self.intent_path = DATA / 'monitor_intent.json'
+        try:
+            intent = json.loads(self.intent_path.read_text())
+            if intent.get('enabled') is True and type(intent.get('send_telegram')) is bool:
+                self.desired = {'send_telegram': intent['send_telegram']}
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError):
+            self.error = 'resume_state_unavailable'
+        LOG.info('controller_started resume_requested=%s', self.desired is not None)
         threading.Thread(target=self.worker, daemon=True).start()
 
     def worker(self):
         while True:
-            action, payload, future = self.jobs.get()
+            try:
+                action, payload, future = self.jobs.get(timeout=1)
+            except queue.Empty:
+                self.supervise()
+                continue
             if not future.set_running_or_notify_cancel():
                 continue
             try:
                 future.set_result(self.execute(action, payload))
             except Exception as exc:
                 self.error = type(exc).__name__
+                LOG.error('action_failed action=%s error_type=%s', action, self.error)
                 future.set_exception(RuntimeError(self.error))
+
+    def save_intent(self, enabled, send_telegram=False):
+        temporary = self.intent_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'enabled': enabled, 'send_telegram': send_telegram}))
+        temporary.chmod(0o600)
+        temporary.replace(self.intent_path)
+
+    def supervise(self):
+        if self.desired is None or (self.process is not None and self.process.poll() is None):
+            return
+        if self.restart_attempts >= 3 or time.monotonic() < self.retry_at:
+            return
+        self.restart_attempts += 1
+        self.retry_at = time.monotonic() + 30 * (2 ** (self.restart_attempts - 1))
+        # Resume only an explicitly started monitor, never enable notifications
+        # merely because the web service was deployed or opened.
+        try:
+            self.launch(self.desired)
+        except Exception as exc:
+            self.error = type(exc).__name__
+            LOG.error('monitor_resume_failed error_type=%s attempt=%s', self.error, self.restart_attempts)
+
+    def launch(self, payload):
+        send = payload.get('send_telegram') is True
+        if send and not (os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')):
+            raise ValueError('telegram_credentials_missing')
+        self.close_browser()
+        (DATA / 'captures' / 'capture_status.json').unlink(missing_ok=True)
+        args = [sys.executable, str(ROOT / 'chart_capture.py'), '--config',
+                str(ROOT / 'monitor.example.json'), '--profile', str(DATA / 'profile'),
+                '--output', str(DATA / 'captures'), '--database', str(DATA / 'events.sqlite')]
+        if send:
+            args.append('--send-telegram')
+        self.process = subprocess.Popen(args, cwd=ROOT)
+        self.started = time.time()
+        self.error = None
+        LOG.info('monitor_started telegram_enabled=%s attempt=%s', send, self.restart_attempts)
 
     def call(self, action, payload=None):
         future = Future()
@@ -112,14 +169,27 @@ class Controller:
             status = None
             path = DATA / 'captures' / 'capture_status.json'
             if path.exists():
-                status = json.loads(path.read_text())
-                status['age_seconds'] = round(time.time() - path.stat().st_mtime)
+                try:
+                    status = json.loads(path.read_text())
+                    status['age_seconds'] = round(time.time() - path.stat().st_mtime)
+                except (ValueError, OSError):
+                    self.error = 'capture_status_unavailable'
+            fresh = bool(running and status and status.get('age_seconds', 601) <= 600)
             return {'monitor_running': running, 'browser_open': self.page is not None,
                     'telegram_configured': bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')),
                     'capture_status': status, 'error_type': self.error,
+                    'monitor_exit_code': self.process.poll() if self.process is not None else None,
+                    'resume_requested': self.desired is not None,
+                    'restart_attempts': self.restart_attempts,
+                    'capture_status_fresh': fresh,
+                    'pilot_alerts_running': bool(fresh and status.get('pilot_alerts_running')),
+                    'visual_alerts_operational': bool(fresh and status.get('visual_alerts_operational')),
                     'storage': 'ephemeral; login and deduplication reset on host restart',
                     'live_validation_completed': False}
         if action == 'stop':
+            self.save_intent(False)
+            self.desired = None
+            self.restart_attempts = 0
             if running:
                 self.process.terminate()
                 try:
@@ -128,23 +198,16 @@ class Controller:
                     self.process.kill()
                     self.process.wait(timeout=5)
             self.process = None
+            LOG.info('monitor_stopped')
             return {'stopped': True}
         if running:
             raise ValueError('stop_monitor_before_login')
         if action == 'start':
-            self.close_browser()
-            # Old captures must never present a previous run as ready.
-            (DATA / 'captures' / 'capture_status.json').unlink(missing_ok=True)
-            args = [sys.executable, str(ROOT / 'chart_capture.py'), '--config',
-                    str(ROOT / 'monitor.example.json'), '--profile', str(DATA / 'profile'),
-                    '--output', str(DATA / 'captures'), '--database', str(DATA / 'events.sqlite')]
-            if payload.get('send_telegram') is True:
-                if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
-                    raise ValueError('telegram_credentials_missing')
-                args.append('--send-telegram')
-            self.error = None
-            self.started = time.time()
-            self.process = subprocess.Popen(args, cwd=ROOT)
+            self.launch(payload)
+            self.save_intent(True, payload.get('send_telegram') is True)
+            self.desired = {'send_telegram': payload.get('send_telegram') is True}
+            self.restart_attempts = 0
+            self.retry_at = time.monotonic() + 30
             return {'started': True, 'validated': False}
         if action == 'open':
             if not self.context:
@@ -277,7 +340,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if len(os.getenv('SETUP_PASSWORD','')) < 24:
         raise SystemExit('SETUP_PASSWORD must contain at least 24 characters')
     Handler.controller=Controller()
+    LOG.info('setup_server_listening')
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
+

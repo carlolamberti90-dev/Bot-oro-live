@@ -3,12 +3,65 @@ import http.client
 import os
 import re
 import threading
+import json
+import tempfile
+import time
+from pathlib import Path
 import unittest
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
-from unittest.mock import patch
-from server import Handler, authorized, valid_session, login_csrf_valid, same_origin
+from unittest.mock import patch, Mock
+from server import Controller, Handler, authorized, valid_session, login_csrf_valid, same_origin
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.data=Path(self.tmp.name)
+        self.env=patch('server.DATA', self.data);self.env.start()
+        self.c=Controller.__new__(Controller)
+        self.c.process=None;self.c.page=None;self.c.context=None;self.c.driver=None
+        self.c.error=None;self.c.started=None;self.c.desired=None
+        self.c.restart_attempts=0;self.c.retry_at=0
+        self.c.intent_path=self.data/'monitor_intent.json'
+    def tearDown(self):
+        self.env.stop();self.tmp.cleanup()
+    def test_deploy_alone_never_starts_monitor(self):
+        with patch.object(self.c,'launch') as launch:
+            self.c.supervise();launch.assert_not_called()
+    def test_crashed_monitor_retries_with_bounded_backoff(self):
+        self.c.desired={'send_telegram':False}
+        with patch.object(self.c,'launch',side_effect=RuntimeError) as launch:
+            self.c.supervise();self.assertEqual(launch.call_count,1)
+            self.c.supervise();self.assertEqual(launch.call_count,1)
+            for _ in range(4):
+                self.c.retry_at=0;self.c.supervise()
+            self.assertEqual(launch.call_count,3)
+    def test_stop_cancels_resume_and_saves_disabled_intent(self):
+        self.c.desired={'send_telegram':True}
+        self.c.execute('stop',{})
+        self.assertIsNone(self.c.desired)
+        self.assertFalse(json.loads(self.c.intent_path.read_text())['enabled'])
+    def test_old_capture_cannot_claim_operational(self):
+        directory=self.data/'captures';directory.mkdir()
+        p=directory/'capture_status.json'
+        p.write_text(json.dumps({'pilot_alerts_running':True,'visual_alerts_operational':True}))
+        os.utime(p,(time.time()-700,time.time()-700))
+        self.c.process=Mock();self.c.process.poll.return_value=None
+        status=self.c.execute('status',{})
+        self.assertFalse(status['capture_status_fresh'])
+        self.assertFalse(status['visual_alerts_operational'])
+        self.assertFalse(status['pilot_alerts_running'])
+    def test_missing_telegram_credentials_does_not_launch_process(self):
+        with patch.dict(os.environ,{},clear=True), patch('server.subprocess.Popen') as process:
+            with self.assertRaises(ValueError):self.c.launch({'send_telegram':True})
+            process.assert_not_called()
+    def test_corrupt_capture_status_does_not_hide_process_status(self):
+        directory=self.data/'captures';directory.mkdir()
+        (directory/'capture_status.json').write_text('{')
+        status=self.c.execute('status',{})
+        self.assertEqual(status['error_type'],'capture_status_unavailable')
+        self.assertFalse(status['visual_alerts_operational'])
 
 class Fake:
     def __init__(self):self.calls=[]
@@ -95,3 +148,4 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.fake.calls,['start'])
 
 if __name__=='__main__':unittest.main()
+
