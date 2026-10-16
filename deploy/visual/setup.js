@@ -8,7 +8,16 @@ byId('open').onclick=safe(async()=>{await action('open');await frame();});
 byId('refresh').onclick=safe(frame);
 byId('stop').onclick=safe(()=>action('stop'));
 byId('type').onclick=safe(async()=>{const value=byId('text').value;byId('text').value='';await action('text',{text:value});await frame();});
-byId('screen').onclick=async e=>{try{const box=e.currentTarget.getBoundingClientRect();await action('click',{x:(e.clientX-box.left)*1280/box.width,y:(e.clientY-box.top)*900/box.height});await frame();}catch(err){byId('message').textContent=err.message;}};
+function screenPoint(image,clientX,clientY){
+  const box=image.getBoundingClientRect(),width=image.naturalWidth,height=image.naturalHeight;
+  if(!width||!height||!box.width||!box.height)throw Error('Aggiorna prima l’immagine.');
+  const scale=Math.min(box.width/width,box.height/height);
+  const left=box.left+(box.width-width*scale)/2,top=box.top+(box.height-height*scale)/2;
+  const x=(clientX-left)/scale,y=(clientY-top)/scale;
+  if(x<0||y<0||x>=width||y>=height)return null;
+  return {x,y};
+}
+byId('screen').onclick=async e=>{try{const point=screenPoint(e.currentTarget,e.clientX,e.clientY);if(!point)return;await action('click',point);await frame();}catch(err){byId('message').textContent=err.message;}};
 document.querySelectorAll('[data-key]').forEach(b=>b.onclick=safe(async()=>{await action('key',{key:b.dataset.key});await frame();}));
 document.querySelectorAll('[data-scroll]').forEach(b=>b.onclick=safe(async()=>{await action('scroll',{dy:Number(b.dataset.scroll)});await frame();}));
 byId('dry').onclick=safe(()=>action('start',{send_telegram:false}));
