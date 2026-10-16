@@ -147,5 +147,38 @@ class SecurityTests(unittest.TestCase):
         with self.request('/action',headers,b'{"action":"start","send_telegram":false}') as r:self.assertEqual(r.status,200)
         self.assertEqual(self.fake.calls,['start'])
 
+class RememberTests(unittest.TestCase):
+    def test_remember_session_survives_module_reload_and_password_rotation_revokes(self):
+        import importlib
+        import server
+        with patch.dict(os.environ, {'SETUP_PASSWORD':'test-only-strong-password-32-characters'}):
+            cookie='monitor_session='+server.session_cookie(True)
+            importlib.reload(server)
+            self.assertTrue(server.valid_session(cookie))
+            with patch.dict(os.environ, {'SETUP_PASSWORD':'another-test-only-password-32-characters'}):
+                self.assertFalse(server.valid_session(cookie))
+    def test_expiration_and_tampering_rejected(self):
+        import server
+        with patch.dict(os.environ, {'SETUP_PASSWORD':'test-only-strong-password-32-characters'}):
+            with patch('server.time.time', return_value=1000):
+                ordinary='monitor_session='+server.session_cookie()
+                remembered='monitor_session='+server.session_cookie(True)
+            with patch('server.time.time', return_value=1000+9*3600):
+                self.assertFalse(server.valid_session(ordinary))
+                self.assertTrue(server.valid_session(remembered))
+                self.assertFalse(server.valid_session(remembered+'0'))
+            with patch('server.time.time', return_value=1000+31*86400):
+                self.assertFalse(server.valid_session(remembered))
+    def test_remember_form_cookie_duration(self):
+        test=SecurityTests()
+        test.setUp()
+        try:
+            conn,r=test.login('username=carlo&password='+test.password+'&remember=1')
+            self.assertEqual(r.status,303)
+            self.assertIn('Max-Age=2592000',r.getheader('Set-Cookie'))
+            r.read();conn.close()
+        finally:
+            test.tearDown()
+
 if __name__=='__main__':unittest.main()
 
