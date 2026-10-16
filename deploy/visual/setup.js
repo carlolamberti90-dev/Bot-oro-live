@@ -7,7 +7,7 @@ function safe(fn){return async()=>{try{await fn();}catch(e){byId('message').text
 byId('open').onclick=safe(async()=>{await action('open');await frame();});
 byId('refresh').onclick=safe(frame);
 byId('stop').onclick=safe(()=>action('stop'));
-byId('type').onclick=safe(async()=>{const value=byId('text').value;byId('text').value='';await action('text',{text:value});await frame();});
+byId('type').onclick=safe(async()=>{const value=byId('text').value;if(!value)throw Error('Scrivi prima nella casella qui sopra.');await action('text',{text:value});byId('text').value='';await frame();byId('message').textContent='Testo trasferito. Premi Invio per continuare.';});
 function screenPoint(image,clientX,clientY){
   const box=image.getBoundingClientRect(),width=image.naturalWidth,height=image.naturalHeight;
   if(!width||!height||!box.width||!box.height)throw Error('Aggiorna prima l’immagine.');
@@ -17,7 +17,7 @@ function screenPoint(image,clientX,clientY){
   if(x<0||y<0||x>=width||y>=height)return null;
   return {x,y};
 }
-byId('screen').onclick=async e=>{try{const point=screenPoint(e.currentTarget,e.clientX,e.clientY);if(!point)return;await action('click',point);await frame();}catch(err){byId('message').textContent=err.message;}};
+byId('screen').onclick=async e=>{try{const point=screenPoint(e.currentTarget,e.clientX,e.clientY);if(!point)return;await action('click',point);await frame();byId('text').scrollIntoView({block:'center'});byId('text').focus({preventScroll:true});byId('message').textContent='Campo selezionato. Scrivi qui e premi Trasferisci al browser.';}catch(err){byId('message').textContent=err.message;}};
 document.querySelectorAll('[data-key]').forEach(b=>b.onclick=safe(async()=>{await action('key',{key:b.dataset.key});await frame();}));
 document.querySelectorAll('[data-scroll]').forEach(b=>b.onclick=safe(async()=>{await action('scroll',{dy:Number(b.dataset.scroll)});await frame();}));
 byId('dry').onclick=safe(()=>action('start',{send_telegram:false}));
