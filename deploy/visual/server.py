@@ -15,7 +15,7 @@ from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from http.cookies import SimpleCookie
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.getenv('MONITOR_DATA_DIR', '/tmp/bubble-monitor'))
@@ -30,6 +30,15 @@ def session_key():
         return None
     return hmac.new(password.encode(), b'bubble-monitor/session-signing/v1', hashlib.sha256).digest()
 LOG = logging.getLogger('bubble_monitor')
+
+def limit_decorative_media(route):
+    """Reduce login-page video load; leave CAPTCHA resources untouched."""
+    request = route.request
+    host = (urlsplit(request.url).hostname or '').lower()
+    if request.resource_type == 'media' and (host == 'tradingview.com' or host.endswith('.tradingview.com')):
+        route.abort()
+    else:
+        route.continue_()
 MOBILE_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso TradingView</title><link rel="stylesheet" href="/signin.css"><main><h1>Accedi a TradingView</h1><p>Accesso diretto sul server del monitor.</p><button id="prepare" type="button">Prepara accesso</button><form id="signin"><label for="email">Email TradingView</label><input id="email" type="email" autocomplete="username" value="carlolamberti90@gmail.com" required><label for="password">Password TradingView</label><input id="password" type="password" autocomplete="current-password" required><button id="submit" type="submit" disabled>Accedi a TradingView</button></form><p id="result" role="status">Inserisci la password TradingView, non quella di Google o del monitor.</p><p>Il monitor non salva la password. Verifica il risultato prima di avviare gli alert.</p><a href="/">Torna al monitor</a></main><script src="/signin.js" defer></script></html>'''
 MOBILE_CSS = b'''*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:#172c35;font:18px system-ui,sans-serif}main{max-width:480px;margin:auto;padding:28px 20px}h1{font-size:28px}label{display:block;margin:22px 0 8px;font-weight:600}input,button{width:100%;font:inherit;padding:15px;border:1px solid #a7b7c0;border-radius:12px}input{background:white}button{margin-top:24px;background:#1264e7;color:white;border:0;font-weight:600}button:disabled{opacity:.6}p{line-height:1.5}a{display:block;padding:16px 0;color:#064fbf}'''
 MOBILE_JS = b'''const form=document.getElementById('signin'),result=document.getElementById('result'),button=document.getElementById('submit'),password=document.getElementById('password');const prepare=document.getElementById('prepare');button.disabled=true;prepare.onclick=async()=>{prepare.disabled=true;button.disabled=true;result.textContent='Preparazione del modulo TradingView. Non inserire ancora la password.';try{const r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body:JSON.stringify({action:'prepare_signin'})});if(!r.ok)throw Error('Preparazione non completata. Controlla il monitor.');const data=await r.json();button.disabled=data.ready!==true;result.textContent=data.message;}catch(e){result.textContent=e.message;}finally{prepare.disabled=false;}};form.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Accesso in corso. Attendi senza premere di nuovo.';let body=JSON.stringify({action:'signin',email:document.getElementById('email').value.trim(),password:password.value});password.value='';try{const response=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body});body=null;const data=await response.json();if(!response.ok)throw Error('Accesso non completato. Torna al monitor per controllare la schermata.');result.textContent=data.message;}catch(error){result.textContent=error.message;}finally{body=null;button.disabled=false;}});'''
@@ -237,6 +246,7 @@ class Controller:
                     self.context = self.driver.chromium.launch_persistent_context(
                         str(DATA / 'profile'), headless=True,
                         viewport={'width':1024,'height':768}, locale='en-US')
+                    self.context.route('**/*', limit_decorative_media)
                     self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
                 secret = self.page.locator('input[type="password"]').filter(visible=True)
                 if secret.count() != 1:
@@ -291,6 +301,7 @@ class Controller:
                 self.context = self.driver.chromium.launch_persistent_context(
                     str(DATA / 'profile'), headless=True,
                     viewport={'width':1280,'height':900}, locale='en-US')
+                self.context.route('**/*', limit_decorative_media)
                 self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             config = json.loads((ROOT / 'monitor.example.json').read_text())
             self.page.goto(config['charts']['M45']['url'], wait_until='domcontentloaded', timeout=30000)
