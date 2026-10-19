@@ -235,22 +235,39 @@ class Controller:
             try:
                 if not email or not password or len(email) > 320 or len(password) > 4096:
                     raise ValueError('invalid_login_fields')
-                self.close_browser()
-                from playwright.sync_api import sync_playwright
-                self.driver = sync_playwright().start()
-                self.context = self.driver.chromium.launch_persistent_context(
-                    str(DATA / 'profile'), headless=True,
-                    viewport={'width':1024,'height':768}, locale='en-US')
-                self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-                self.page.goto('https://www.tradingview.com/accounts/signin/',
-                               wait_until='domcontentloaded', timeout=30000)
+                if not self.context or not self.page or self.page.is_closed():
+                    self.close_browser()
+                    from playwright.sync_api import sync_playwright
+                    self.driver = sync_playwright().start()
+                    self.context = self.driver.chromium.launch_persistent_context(
+                        str(DATA / 'profile'), headless=True,
+                        viewport={'width':1024,'height':768}, locale='en-US')
+                    self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+                # A slow background resource must not discard a usable form.
+                # Reuse the email form if it has already finished loading.
+                secret = self.page.locator('input[type="password"]').filter(visible=True)
+                if secret.count() != 1:
+                    from playwright.sync_api import TimeoutError as BrowserTimeout
+                    try:
+                        self.page.goto('https://www.tradingview.com/accounts/signin/',
+                                       wait_until='commit', timeout=15000)
+                    except BrowserTimeout:
+                        return {'message':'TradingView sta caricando lentamente. Nessun dato inserito. Torna al monitor e verifica la pagina prima di riprovare.'}
                 if self.page.get_by_text('Verify you are human', exact=False).count():
                     return {'message':'TradingView richiede una verifica umana. Torna al monitor; non ripetere la password.'}
                 email_option = self.page.get_by_text('Email', exact=True)
+                try:
+                    self.page.locator('input[type="password"]').filter(visible=True).wait_for(timeout=8000)
+                except Exception:
+                    pass  # Some layouts show the Email method before the form.
                 if email_option.count() == 1 and email_option.is_visible():
                     email_option.click(timeout=5000)
                 username = self.page.locator('input[name="id_username"], input[name="username"], input[autocomplete="username"], input[type="email"]').filter(visible=True)
                 secret = self.page.locator('input[type="password"]').filter(visible=True)
+                try:
+                    secret.wait_for(timeout=8000)
+                except Exception:
+                    return {'message':'Modulo email ancora non disponibile. Nessun dato inserito. Torna al monitor per controllare.'}
                 if username.count() != 1 or secret.count() != 1:
                     return {'message':'Modulo TradingView non riconosciuto. Torna al monitor; nessuna password inserita.'}
                 username.fill(email, timeout=5000)
