@@ -276,6 +276,11 @@ class Controller:
                 if submit.count() != 1:
                     secret.fill('')
                     return {'message':'Pulsante di accesso non riconosciuto. Torna al monitor.'}
+                # TradingView disables submission while a CAPTCHA is pending.
+                # Do not wait for a disabled button or retry credentials.
+                if not submit.is_enabled():
+                    self.error = None
+                    return {'verification_required': True, 'message':'TradingView richiede una verifica di sicurezza prima di accedere. Email e password sono gia inserite: torna al monitor, premi Aggiorna immagine e completa la verifica. Non reinserire la password.'}
                 submit.click(timeout=5000)
                 return {'message':'Dati inviati a TradingView. Torna al monitor e premi Aggiorna immagine per verificare accesso o eventuale codice. Gli alert non sono ancora attivi.'}
             finally:
