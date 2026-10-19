@@ -30,9 +30,9 @@ def session_key():
         return None
     return hmac.new(password.encode(), b'bubble-monitor/session-signing/v1', hashlib.sha256).digest()
 LOG = logging.getLogger('bubble_monitor')
-MOBILE_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso TradingView</title><link rel="stylesheet" href="/signin.css"><main><h1>Accedi a TradingView</h1><p>Accesso diretto sul server del monitor.</p><form id="signin"><label for="email">Email TradingView</label><input id="email" type="email" autocomplete="username" value="carlolamberti90@gmail.com" required><label for="password">Password TradingView</label><input id="password" type="password" autocomplete="current-password" required><button id="submit" type="submit">Accedi a TradingView</button></form><p id="result" role="status">Inserisci la password TradingView, non quella di Google o del monitor.</p><p>Il monitor non salva la password. Verifica il risultato prima di avviare gli alert.</p><a href="/">Torna al monitor</a></main><script src="/signin.js" defer></script></html>'''
+MOBILE_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso TradingView</title><link rel="stylesheet" href="/signin.css"><main><h1>Accedi a TradingView</h1><p>Accesso diretto sul server del monitor.</p><button id="prepare" type="button">Prepara accesso</button><form id="signin"><label for="email">Email TradingView</label><input id="email" type="email" autocomplete="username" value="carlolamberti90@gmail.com" required><label for="password">Password TradingView</label><input id="password" type="password" autocomplete="current-password" required><button id="submit" type="submit" disabled>Accedi a TradingView</button></form><p id="result" role="status">Inserisci la password TradingView, non quella di Google o del monitor.</p><p>Il monitor non salva la password. Verifica il risultato prima di avviare gli alert.</p><a href="/">Torna al monitor</a></main><script src="/signin.js" defer></script></html>'''
 MOBILE_CSS = b'''*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:#172c35;font:18px system-ui,sans-serif}main{max-width:480px;margin:auto;padding:28px 20px}h1{font-size:28px}label{display:block;margin:22px 0 8px;font-weight:600}input,button{width:100%;font:inherit;padding:15px;border:1px solid #a7b7c0;border-radius:12px}input{background:white}button{margin-top:24px;background:#1264e7;color:white;border:0;font-weight:600}button:disabled{opacity:.6}p{line-height:1.5}a{display:block;padding:16px 0;color:#064fbf}'''
-MOBILE_JS = b'''const form=document.getElementById('signin'),result=document.getElementById('result'),button=document.getElementById('submit'),password=document.getElementById('password');form.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Accesso in corso. Attendi senza premere di nuovo.';let body=JSON.stringify({action:'signin',email:document.getElementById('email').value.trim(),password:password.value});password.value='';try{const response=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body});body=null;const data=await response.json();if(!response.ok)throw Error('Accesso non completato. Torna al monitor per controllare la schermata.');result.textContent=data.message;}catch(error){result.textContent=error.message;}finally{body=null;button.disabled=false;}});'''
+MOBILE_JS = b'''const form=document.getElementById('signin'),result=document.getElementById('result'),button=document.getElementById('submit'),password=document.getElementById('password');const prepare=document.getElementById('prepare');button.disabled=true;prepare.onclick=async()=>{prepare.disabled=true;button.disabled=true;result.textContent='Preparazione del modulo TradingView. Non inserire ancora la password.';try{const r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body:JSON.stringify({action:'prepare_signin'})});if(!r.ok)throw Error('Preparazione non completata. Controlla il monitor.');const data=await r.json();button.disabled=data.ready!==true;result.textContent=data.message;}catch(e){result.textContent=e.message;}finally{prepare.disabled=false;}};form.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Accesso in corso. Attendi senza premere di nuovo.';let body=JSON.stringify({action:'signin',email:document.getElementById('email').value.trim(),password:password.value});password.value='';try{const response=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body});body=null;const data=await response.json();if(!response.ok)throw Error('Accesso non completato. Torna al monitor per controllare la schermata.');result.textContent=data.message;}catch(error){result.textContent=error.message;}finally{body=null;button.disabled=false;}});'''
 LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><p><label><input name="remember" type="checkbox" value="1"> Ricordami su questo dispositivo per 30 giorni</label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
 
 
@@ -227,6 +227,33 @@ class Controller:
             self.restart_attempts = 0
             self.retry_at = time.monotonic() + 30
             return {'started': True, 'validated': False}
+        if action == 'prepare_signin':
+            # No email or password is accepted during page preparation.
+            try:
+                if not self.context or not self.page or self.page.is_closed():
+                    self.close_browser()
+                    from playwright.sync_api import sync_playwright
+                    self.driver = sync_playwright().start()
+                    self.context = self.driver.chromium.launch_persistent_context(
+                        str(DATA / 'profile'), headless=True,
+                        viewport={'width':1024,'height':768}, locale='en-US')
+                    self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+                secret = self.page.locator('input[type="password"]').filter(visible=True)
+                if secret.count() != 1:
+                    if 'tradingview.com/accounts/signin' not in self.page.url:
+                        self.page.goto('https://www.tradingview.com/accounts/signin/',
+                                       wait_until='commit', timeout=15000)
+                    option = self.page.get_by_text('Email', exact=True)
+                    option.wait_for(state='visible', timeout=12000)
+                    option.click(timeout=12000)
+                    secret.wait_for(state='visible', timeout=8000)
+                username = self.page.locator('input[name="id_username"], input[name="username"], input[autocomplete="username"], input[type="email"]').filter(visible=True)
+                ready = username.count() == 1 and secret.count() == 1
+                self.error = None
+                return {'ready':ready, 'message':'Modulo email pronto. Ora puoi inserire la password TradingView.' if ready else 'Modulo non riconosciuto. Nessuna password richiesta.'}
+            except Exception as exc:
+                LOG.info('login_prepare_failed error_type=%s', type(exc).__name__)
+                return {'ready':False, 'message':'Il modulo email non e ancora pronto sul server. Nessuna password richiesta. Controlla la schermata nel monitor prima di riprovare la preparazione.'}
         if action == 'signin':
             # Values come directly from the authenticated user's HTTPS form.
             # Never write credentials to disk, configuration, status, or logs.
@@ -236,38 +263,9 @@ class Controller:
                 if not email or not password or len(email) > 320 or len(password) > 4096:
                     raise ValueError('invalid_login_fields')
                 if not self.context or not self.page or self.page.is_closed():
-                    self.close_browser()
-                    from playwright.sync_api import sync_playwright
-                    self.driver = sync_playwright().start()
-                    self.context = self.driver.chromium.launch_persistent_context(
-                        str(DATA / 'profile'), headless=True,
-                        viewport={'width':1024,'height':768}, locale='en-US')
-                    self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-                # A slow background resource must not discard a usable form.
-                # Reuse the email form if it has already finished loading.
-                secret = self.page.locator('input[type="password"]').filter(visible=True)
-                if secret.count() != 1:
-                    from playwright.sync_api import TimeoutError as BrowserTimeout
-                    try:
-                        self.page.goto('https://www.tradingview.com/accounts/signin/',
-                                       wait_until='commit', timeout=15000)
-                    except BrowserTimeout:
-                        return {'message':'TradingView sta caricando lentamente. Nessun dato inserito. Torna al monitor e verifica la pagina prima di riprovare.'}
-                if self.page.get_by_text('Verify you are human', exact=False).count():
-                    return {'message':'TradingView richiede una verifica umana. Torna al monitor; non ripetere la password.'}
-                email_option = self.page.get_by_text('Email', exact=True)
-                try:
-                    self.page.locator('input[type="password"]').filter(visible=True).wait_for(timeout=8000)
-                except Exception:
-                    pass  # Some layouts show the Email method before the form.
-                if email_option.count() == 1 and email_option.is_visible():
-                    email_option.click(timeout=5000)
+                    return {'message':'Prepara prima il modulo TradingView. Nessun dato inserito.'}
                 username = self.page.locator('input[name="id_username"], input[name="username"], input[autocomplete="username"], input[type="email"]').filter(visible=True)
                 secret = self.page.locator('input[type="password"]').filter(visible=True)
-                try:
-                    secret.wait_for(timeout=8000)
-                except Exception:
-                    return {'message':'Modulo email ancora non disponibile. Nessun dato inserito. Torna al monitor per controllare.'}
                 if username.count() != 1 or secret.count() != 1:
                     return {'message':'Modulo TradingView non riconosciuto. Torna al monitor; nessuna password inserita.'}
                 username.fill(email, timeout=5000)
@@ -417,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path != '/action' or not isinstance(payload,dict):
                 return self.reply(400,{'error':'invalid_action'})
             action=payload.pop('action',None)
-            if action not in ('open','start','stop','click','text','key','scroll','signin'):
+            if action not in ('open','start','stop','click','text','key','scroll','signin','prepare_signin'):
                 return self.reply(400,{'error':'invalid_action'})
             self.reply(200,self.controller.call(action,payload))
         except Exception:
