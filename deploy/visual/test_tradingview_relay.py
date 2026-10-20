@@ -1,5 +1,5 @@
 import unittest
-from tradingview_relay import parse_message, receive_http
+from tradingview_relay import parse_message, receive_http, TEST_MESSAGE
 
 class FakeHandler:
     path = '/webhooks/tradingview/test-secret'
@@ -7,6 +7,9 @@ class FakeHandler:
         self.result = code, data
 
 class RelayTests(unittest.TestCase):
+    def test_labelled_connection_test(self):
+        self.assertEqual(parse_message(TEST_MESSAGE.encode()), (TEST_MESSAGE, 'TEST'))
+
     def test_actual_tradingview_message(self):
         message, timeframe = parse_message('SHORT 🔴 | OANDA:XAUUSD | TF 15 | Bubble appena comparsa | Prezzo 4126.870'.encode())
         self.assertEqual(timeframe, '15')

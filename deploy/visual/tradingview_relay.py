@@ -12,11 +12,14 @@ import urllib.request
 import uuid
 from urllib.parse import urlsplit
 
+TEST_MESSAGE = '🧪 TEST COLLEGAMENTO TradingView → Render → Telegram. Nessun segnale operativo.'
 PATTERN = re.compile(r'^(LONG 🟢|SHORT 🔴) \| OANDA:XAUUSD \| TF (3|5|15|30|45|60|240|D|1D) \| Bubble appena comparsa \| Prezzo ([0-9]+(?:\.[0-9]+)?)$')
 
 
 def parse_message(raw):
     message = raw.decode('utf-8').strip()
+    if message == TEST_MESSAGE:
+        return message, 'TEST'
     match = PATTERN.fullmatch(message)
     if not match or not math.isfinite(float(match[3])) or float(match[3]) <= 0:
         raise ValueError('invalid_bubble')
