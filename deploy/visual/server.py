@@ -1,6 +1,7 @@
 """Authenticated setup browser and monitor launcher; no browser profile export."""
 import base64
 import hmac
+import html
 import hashlib
 import json
 import logging
@@ -42,6 +43,8 @@ def limit_decorative_media(route):
 MOBILE_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso TradingView</title><link rel="stylesheet" href="/signin.css"><main><h1>Accedi a TradingView</h1><p>Accesso diretto sul server del monitor.</p><button id="prepare" type="button">Prepara accesso</button><form id="signin"><label for="email">Email TradingView</label><input id="email" type="email" autocomplete="username" value="carlolamberti90@gmail.com" required><label for="password">Password TradingView</label><input id="password" type="password" autocomplete="current-password" required><button id="submit" type="submit" disabled>Accedi a TradingView</button></form><p id="result" role="status">Inserisci la password TradingView, non quella di Google o del monitor.</p><p>Il monitor non salva la password. Verifica il risultato prima di avviare gli alert.</p><a href="/">Torna al monitor</a></main><script src="/signin.js" defer></script></html>'''
 MOBILE_CSS = b'''*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:#172c35;font:18px system-ui,sans-serif}main{max-width:480px;margin:auto;padding:28px 20px}h1{font-size:28px}label{display:block;margin:22px 0 8px;font-weight:600}input,button{width:100%;font:inherit;padding:15px;border:1px solid #a7b7c0;border-radius:12px}input{background:white}button{margin-top:24px;background:#1264e7;color:white;border:0;font-weight:600}button:disabled{opacity:.6}p{line-height:1.5}a{display:block;padding:16px 0;color:#064fbf}'''
 MOBILE_JS = b'''const form=document.getElementById('signin'),result=document.getElementById('result'),button=document.getElementById('submit'),password=document.getElementById('password');const prepare=document.getElementById('prepare');button.disabled=true;prepare.onclick=async()=>{prepare.disabled=true;button.disabled=true;result.textContent='Preparazione del modulo TradingView. Non inserire ancora la password.';try{const r=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body:JSON.stringify({action:'prepare_signin'})});if(!r.ok)throw Error('Preparazione non completata. Controlla il monitor.');const data=await r.json();button.disabled=data.ready!==true;result.textContent=data.message;}catch(e){result.textContent=e.message;}finally{prepare.disabled=false;}};form.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Accesso in corso. Attendi senza premere di nuovo.';let body=JSON.stringify({action:'signin',email:document.getElementById('email').value.trim(),password:password.value});password.value='';try{const response=await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Action':'1'},body});body=null;const data=await response.json();if(!response.ok)throw Error('Accesso non completato. Torna al monitor per controllare la schermata.');result.textContent=data.message;}catch(error){result.textContent=error.message;}finally{body=null;button.disabled=false;}});'''
+CONNECT_PAGE = '''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Collega gli alert a Telegram</title><link rel="stylesheet" href="/signin.css"><main><h1>Collega gli alert a Telegram</h1><p>Il ricevitore Telegram e pronto. Completa il collegamento negli otto alert TradingView gia esistenti.</p><label for="webhook">Collegamento webhook privato</label><textarea id="webhook" readonly rows="5" autocomplete="off" autocapitalize="none" spellcheck="false">__WEBHOOK_URL__</textarea><p>Tieni premuto sul collegamento, scegli Seleziona tutto e poi Copia.</p><ol><li>Apri TradingView e la lista degli alert.</li><li>Modifica un alert Carlo Bubble Alerts.</li><li>In Notifiche, mantieni attivo Notifica nell'app e attiva URL webhook.</li><li>Incolla il collegamento completo. Premi Applica e poi Salva.</li></ol><p>Ripeti sugli alert M3, M5, M15, M30, M45, H1, H4 e D1. Mantieni condizioni, messaggi e parametri attuali.</p><p>Quando hai salvato gli otto alert, torna in chat: controlleremo l'arrivo di una nuova bubble e la consegna a Telegram. Il collegamento completo non e verificato fino a quel controllo.</p><p>Condividi questo collegamento solo con i tuoi alert TradingView.</p><a href="/">Torna al monitor</a></main></html>'''
+
 LOGIN_PAGE = b'''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Accesso monitor oro</title><main><h1>Accesso monitor oro</h1><p>Inserisci le credenziali del monitor. Non sono quelle di TradingView.</p><form action="/login" method="post"><p><label>Utente <input name="username" autocomplete="username" required></label></p><p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p><p><label><input name="remember" type="checkbox" value="1"> Ricordami su questo dispositivo per 30 giorni</label></p><button type="submit">Entra nel monitor</button></form><p>Se l'accesso non riesce, controlla di aver copiato tutta la password, rispettando maiuscole e minuscole.</p></main></html>'''
 
 
@@ -372,11 +375,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
             return self.reply(200,{'service':'setup_available','monitor_operational':False,'webhook_configured':self.relay is not None})
-        if self.path == '/login' or (self.path == '/' and not valid_session(self.headers.get('Cookie')) and not authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD',''))):
+        if self.path == '/login' or (self.path in ('/', '/connect') and not valid_session(self.headers.get('Cookie')) and not authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD',''))):
             return self.show_login()
         if not self.access():
             return
         try:
+            if self.path == '/connect':
+                secret = os.getenv('TV_RELAY_SECRET', '')
+                if self.relay is None or len(secret) < 32:
+                    return self.reply(503, {'error': 'relay_not_configured'})
+                url = 'https://oro-bubble-monitor.onrender.com/webhooks/tradingview/' + secret
+                page = CONNECT_PAGE.replace('__WEBHOOK_URL__', html.escape(url)).encode('utf-8')
+                return self.reply(200, page, 'text/html; charset=utf-8')
             if self.path == '/signin':
                 return self.reply(200,MOBILE_PAGE,'text/html; charset=utf-8')
             if self.path == '/signin.css':
