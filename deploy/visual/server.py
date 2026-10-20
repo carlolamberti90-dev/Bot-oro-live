@@ -334,6 +334,7 @@ class Controller:
 
 class Handler(BaseHTTPRequestHandler):
     controller = None
+    relay = None
     def log_message(self, *args):
         pass  # No URLs, Authorization headers or typed login data in logs.
 
@@ -370,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            return self.reply(200,{'service':'setup_available','monitor_operational':False})
+            return self.reply(200,{'service':'setup_available','monitor_operational':False,'webhook_configured':self.relay is not None})
         if self.path == '/login' or (self.path == '/' and not valid_session(self.headers.get('Cookie')) and not authorized(self.headers.get('Authorization'),os.getenv('SETUP_PASSWORD',''))):
             return self.show_login()
         if not self.access():
@@ -383,7 +384,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/signin.js':
                 return self.reply(200,MOBILE_JS,'application/javascript')
             if self.path == '/status':
-                return self.reply(200,self.controller.call('status'))
+                status = self.controller.call('status')
+                status['tradingview_relay'] = self.relay.status() if self.relay else {'configured': False}
+                return self.reply(200,status)
             if self.path == '/frame':
                 return self.reply(200,self.controller.call('frame'),'image/jpeg')
             files={'/':('setup.html','text/html; charset=utf-8'),'/setup.js':('setup.js','application/javascript'),'/setup.css':('setup.css','text/css')}
@@ -395,6 +398,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(409,{'error':'action_unavailable; inspect status'})
 
     def do_POST(self):
+        from tradingview_relay import receive_http
+        if receive_http(self, self.relay):
+            return
         if self.path == '/login':
             try:
                 length=int(self.headers.get('Content-Length','0'))
@@ -437,6 +443,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if len(os.getenv('SETUP_PASSWORD','')) < 24:
         raise SystemExit('SETUP_PASSWORD must contain at least 24 characters')
+    from tradingview_relay import configured_relay
+    Handler.relay=configured_relay()
     Handler.controller=Controller()
     LOG.info('setup_server_listening')
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
