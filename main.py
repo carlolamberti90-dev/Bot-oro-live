@@ -1,3 +1,25 @@
+# Bot paused at the owner's request. Set BOT_DISABLED=false only to explicitly resume.
+if __name__ == "__main__":
+    import os as _pause_os
+    if _pause_os.getenv("BOT_DISABLED", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        from http.server import BaseHTTPRequestHandler as _PauseHandler, ThreadingHTTPServer as _PauseServer
+        class _PausedBotHandler(_PauseHandler):
+            def do_GET(self):
+                body = b'{"status":"disabled","bot_operational":false,"telegram_enabled":false}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_HEAD(self):
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        print("Bot disabled by owner: no market monitoring or Telegram notifications.", flush=True)
+        _PauseServer(("0.0.0.0", int(_pause_os.getenv("PORT", "10000"))), _PausedBotHandler).serve_forever()
+        raise SystemExit(0)
+
 # Closed-bar logic adapted from © LuxAlgo Volumetric Order Flow Structure.
 # CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
 import os
